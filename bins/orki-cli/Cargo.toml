@@ -10,10 +10,10 @@ name = "orki"
 path = "src/main.rs"
 
 [dependencies]
-orki-core = { path = "../../crates/orki-core" }
-orki-pack = { path = "../../crates/orki-pack" }
-orki-tauri = { path = "../../crates/orki-tauri" }
-orki-schema = { path = "../../crates/orki-schema" }
+orki-core = { path = "../../crates/orki-core", version = "0.0.1" }
+orki-pack = { path = "../../crates/orki-pack", version = "0.0.1" }
+orki-tauri = { path = "../../crates/orki-tauri", version = "0.0.1" }
+orki-schema = { path = "../../crates/orki-schema", version = "0.0.1" }
 toml = { workspace = true }
 
 [lints]

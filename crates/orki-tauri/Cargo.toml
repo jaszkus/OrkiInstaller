@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-orki-core = { path = "../orki-core" }
+orki-core = { path = "../orki-core", version = "0.0.1" }
 thiserror = { workspace = true }
 
 [lints]
