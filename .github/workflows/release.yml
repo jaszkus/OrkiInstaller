@@ -17,7 +17,7 @@ jobs:
       - run: cargo xtask build --variant full --profile release
       - run: cargo xtask size-budget --variant full --profile release
       - run: cargo xtask audit-imports --variant full --profile release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: orki-stub-full-release
           path: target/release/orki-stub.exe
