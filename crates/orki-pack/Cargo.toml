@@ -10,7 +10,7 @@ serde = { workspace = true }
 postcard = { version = "1", features = ["alloc"] }
 crc32fast = { workspace = true }
 blake3 = { workspace = true }
-orki-core = { path = "../orki-core" }
+orki-core = { path = "../orki-core", version = "0.0.1" }
 thiserror = { workspace = true }
 
 [lints]

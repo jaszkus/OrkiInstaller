@@ -29,16 +29,17 @@ deny = [
     { name = "aws-lc-sys" },
     { name = "aws-lc-rs" },
     { name = "ring" },
-    { name = "cc" },
     { name = "cmake" },
     { name = "bindgen" },
     { name = "pkg-config" },
 ]
-skip-tree = []
 
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill is a transitive dep of postcard via heapless; unmaintained but no safe upgrade; tracked in docs/dependency-waivers.md" },
+]
 
 [sources]
 unknown-registry = "deny"
