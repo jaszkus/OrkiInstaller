@@ -12,7 +12,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - run: cargo xtask build --variant full --profile release
       - run: cargo xtask size-budget --variant full --profile release
