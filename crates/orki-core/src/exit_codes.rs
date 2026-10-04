@@ -1,0 +1,8 @@
+pub const SUCCESS: i32 = 0;
+pub const USER_CANCELLED: i32 = 1602;
+pub const FATAL_ERROR: i32 = 1603;
+pub const OTHER_INSTALL_RUNNING: i32 = 1618;
+pub const NEWER_VERSION_INSTALLED: i32 = 1638;
+pub const BAD_PACKAGE: i32 = 1620;
+pub const REBOOT_INITIATED: i32 = 1641;
+pub const REBOOT_REQUIRED: i32 = 3010;

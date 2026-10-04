@@ -1,0 +1,13 @@
+/target/
+*.pfx
+*.snk
+*.p12
+*.key
+*.pem
+.env
+.env.*
+*.orkisign
+*.log
+.freebuff/
+Thumbs.db
+.DS_Store

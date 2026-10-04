@@ -1,0 +1,20 @@
+[package]
+name = "orki-cli"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "orki"
+path = "src/main.rs"
+
+[dependencies]
+orki-core = { path = "../../crates/orki-core" }
+orki-pack = { path = "../../crates/orki-pack" }
+orki-tauri = { path = "../../crates/orki-tauri" }
+orki-schema = { path = "../../crates/orki-schema" }
+toml = { workspace = true }
+
+[lints]
+workspace = true

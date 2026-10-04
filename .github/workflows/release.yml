@@ -1,0 +1,23 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build
+    environment: release
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask build --variant full --profile release
+      - run: cargo xtask size-budget --variant full --profile release
+      - run: cargo xtask audit-imports --variant full --profile release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orki-stub-full-release
+          path: target/release/orki-stub.exe

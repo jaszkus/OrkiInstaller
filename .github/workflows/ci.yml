@@ -1,0 +1,69 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo xtask lint
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask test
+
+  stub:
+    name: stub (${{ matrix.variant }})
+    needs: [lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [full, lite, headless]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask build --variant ${{ matrix.variant }} --profile ci
+      - run: cargo xtask size-budget --variant ${{ matrix.variant }} --profile ci
+      - run: cargo xtask audit-imports --variant ${{ matrix.variant }} --profile ci
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stub-${{ matrix.variant }}
+          path: target/ci/orki-stub.exe
+
+  e2e:
+    name: e2e
+    needs: [stub]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask e2e
