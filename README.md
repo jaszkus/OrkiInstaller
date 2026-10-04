@@ -1,5 +1,7 @@
 # OrkiInstaller (orki)
 
+[![ci](https://github.com/jaszkus/OrkiInstaller/actions/workflows/ci.yml/badge.svg)](https://github.com/jaszkus/OrkiInstaller/actions/workflows/ci.yml)
+
 Rust-native installer builder with an iced + wgpu UI — an NSIS alternative, designed Tauri v2-first.
 
 ## Status
