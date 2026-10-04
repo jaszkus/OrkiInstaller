@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "crisp", "web-colors", "thread-pool"] }
+wgpu = "27"
+bytemuck = { version = "1", features = ["derive"] }
+orki-core = { path = "../orki-core", version = "0.0.1" }
+orki-gfx = { path = "../orki-gfx", version = "0.0.1" }
 
 [lints]
 workspace = true

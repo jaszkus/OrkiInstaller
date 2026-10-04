@@ -97,6 +97,23 @@ fn main() {
     exit(dispatch(&args));
 }
 
+#[cfg(feature = "gui")]
+fn run_gui() -> i32 {
+    match orki_ui::shader_app::run() {
+        Ok(()) => 0,
+        Err(_) => {
+            eprintln!("gpu/ui unavailable, falling back to silent");
+            1603
+        }
+    }
+}
+
+#[cfg(not(feature = "gui"))]
+fn run_gui() -> i32 {
+    eprintln!("gui not available in this variant");
+    1603
+}
+
 fn dispatch(args: &Args) -> i32 {
     if args.bad {
         eprintln!("missing value for option");
@@ -148,9 +165,11 @@ fn dispatch(args: &Args) -> i32 {
         },
         Some(_) | None => match read_self_manifest() {
             Ok(m) => {
+                if m.files.is_empty() {
+                    return 1620;
+                }
                 println!("app: {} {} ({})", m.app_name, m.app_version, m.app_id);
-                println!("engine: plan-execute not implemented yet (roadmap phase 1)");
-                0
+                run_gui()
             }
             Err(e) => {
                 eprintln!("{e}");
