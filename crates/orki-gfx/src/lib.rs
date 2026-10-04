@@ -1,5 +1,7 @@
+use bytemuck::{Pod, Zeroable};
+
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct OrkiUniforms {
     pub resolution: [f32; 2],
     pub time: f32,
@@ -45,6 +47,8 @@ impl OrkiUniforms {
         }
     }
 }
+
+pub const AURORA_WGSL: &str = include_str!("../../../shaders/aurora.wgsl");
 
 pub const PRESETS: [&str; 8] = [
     "aurora",
@@ -96,7 +100,9 @@ pub const FULLSCREEN_TRIANGLE: [[f32; 2]; 3] = [[-1.0, -1.0], [3.0, -1.0], [-1.0
 
 #[cfg(test)]
 mod tests {
-    use super::{AdapterInfo, GfxBackend, ORKI_UNIFORMS_SIZE, OrkiUniforms, PRESETS, Quality};
+    use super::{
+        AURORA_WGSL, AdapterInfo, GfxBackend, ORKI_UNIFORMS_SIZE, OrkiUniforms, PRESETS, Quality,
+    };
 
     #[test]
     fn uniforms_layout_stable() {
@@ -115,6 +121,12 @@ mod tests {
         assert_eq!(PRESETS.len(), 8);
         assert!(PRESETS.contains(&"glow-bar"));
         assert_eq!(Quality::Auto, Quality::Auto);
+    }
+
+    #[test]
+    fn aurora_shader_embedded() {
+        assert!(AURORA_WGSL.contains("@fragment"));
+        assert!(AURORA_WGSL.contains("var<uniform> orki"));
     }
 
     #[test]
