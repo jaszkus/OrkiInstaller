@@ -1,0 +1,23 @@
+[package]
+name = "orki-stub"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "orki-stub"
+path = "src/main.rs"
+
+[features]
+default = ["full"]
+full = []
+lite = []
+headless = []
+
+[dependencies]
+orki-core = { path = "../../crates/orki-core" }
+orki-pack = { path = "../../crates/orki-pack" }
+
+[lints]
+workspace = true

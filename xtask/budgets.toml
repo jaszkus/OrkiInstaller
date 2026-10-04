@@ -1,0 +1,8 @@
+[full]
+max_mib = 25
+
+[lite]
+max_mib = 15
+
+[headless]
+max_mib = 10
