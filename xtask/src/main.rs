@@ -136,6 +136,7 @@ fn cmd_build(rest: &[String]) -> i32 {
         "build".to_string(),
         "-p".to_string(),
         "orki-stub".to_string(),
+        "--no-default-features".to_string(),
         "--features".to_string(),
         variant.clone(),
         "--profile".to_string(),
@@ -342,7 +343,7 @@ fn yes_no(v: bool) -> &'static str {
     if v { "ok" } else { "missing" }
 }
 
-const ALLOWED_DLLS: [&str; 24] = [
+const ALLOWED_DLLS: [&str; 27] = [
     "kernel32.dll",
     "user32.dll",
     "gdi32.dll",
@@ -353,6 +354,7 @@ const ALLOWED_DLLS: [&str; 24] = [
     "ntdll.dll",
     "ws2_32.dll",
     "bcrypt.dll",
+    "bcryptprimitives.dll",
     "userenv.dll",
     "dbghelp.dll",
     "sync.dll",
@@ -361,6 +363,8 @@ const ALLOWED_DLLS: [&str; 24] = [
     "d3dcompiler_47.dll",
     "winhttp.dll",
     "vulkan-1.dll",
+    "opengl32.dll",
+    "imm32.dll",
     "comdlg32.dll",
     "shlwapi.dll",
     "propsys.dll",
