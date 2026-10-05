@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Payload format v1 implemented in `orki-pack` (spec in `docs/format.md`): 64-byte `ORKIHDR` payload header, offsets relative to the overlay start, PE-section-based payload location (Authenticode-tolerant), decompression caps (`raw_len + 1`), format hard limits enforced before allocation, unsupported-version rejection, and trailing-bytes tolerance for signature tables. Reader keeps read-only v0 footer compatibility; the writer emits v1 only.
+- `orki inspect` reports format version, overlay offset, signature state, and integrity; `orki pack`/`wrap` produce v1 payloads and self-check them before writing; `pack` excludes its own output file from the walk.
+
 - Payload format v1 specification (`docs/format.md`, draft for owner ratification): PE-overlay location tolerant of Authenticode, relative offsets, Ed25519 signature block, embedded config/assets sections, hard limits, and a fail-closed validation pipeline.
 - `orki-core`: manifest validation rejects `package.compression = "zstd"` with a clear message per ADR-0002 (codec id stays reserved).
 

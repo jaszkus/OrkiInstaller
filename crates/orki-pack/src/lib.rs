@@ -1,3 +1,12 @@
+pub mod format;
+
+pub use format::{
+    FLAG_HAS_ASSETS, FLAG_HAS_STRING_TABLE, FLAG_HAS_UNINSTALLER, FLAG_SIGNED, HEADER_MAGIC,
+    HEADER_SIZE, MAX_ASSETS, MAX_CHUNKS, MAX_FILE_SIZE, MAX_FILES, MAX_MANIFEST_LEN,
+    MAX_PATH_UTF16, MAX_RAW_CHUNK, MAX_TOTAL_RAW, PAYLOAD_FORMAT_VERSION, PayloadHeader,
+    SIGNATURE_BLOCK_SIZE, locate, overlay_start, read_payload_header, write_header,
+};
+
 pub const MAGIC: [u8; 8] = *b"ORKIPACK";
 pub const FORMAT_VERSION: u32 = 1;
 pub const FOOTER_SIZE: u64 = 64;
@@ -29,6 +38,8 @@ pub enum PackError {
     Manifest(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("unsupported payload format version: {0}")]
+    UnsupportedVersion(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -93,7 +104,6 @@ impl AppMeta {
 }
 
 pub struct PackBuilder {
-    base: u64,
     body: Vec<u8>,
     chunks: Vec<Chunk>,
     files: Vec<FileEntry>,
@@ -107,9 +117,8 @@ impl Default for PackBuilder {
 }
 
 impl PackBuilder {
-    pub fn new(base: u64) -> Self {
+    pub fn new(_base: u64) -> Self {
         Self {
-            base,
             body: Vec::new(),
             chunks: Vec::new(),
             files: Vec::new(),
@@ -130,7 +139,7 @@ impl PackBuilder {
             return Err(PackError::Manifest(format!("duplicate path: {path}")));
         }
         let chunk_start = self.chunks.len() as u32;
-        let offset = self.base + self.body.len() as u64;
+        let offset = HEADER_SIZE as u64 + self.body.len() as u64;
         if data.is_empty() {
             self.files.push(FileEntry {
                 path,
@@ -173,7 +182,6 @@ impl PackBuilder {
     }
 
     pub fn finish(self, meta: &AppMeta) -> Vec<u8> {
-        let mut out = self.body;
         let manifest = PackManifest {
             schema: 1,
             app_id: meta.id.clone(),
@@ -182,21 +190,23 @@ impl PackBuilder {
             files: self.files,
             chunks: self.chunks,
         };
-        let manifest_offset = self.base + out.len() as u64;
         let encoded = postcard::to_allocvec(&manifest).expect("postcard encode");
         let manifest_crc32 = crc32fast::hash(&encoded);
         let manifest_len = encoded.len() as u64;
+        let manifest_offset = HEADER_SIZE as u64 + self.body.len() as u64;
+        let payload_len = manifest_offset + manifest_len;
+        let header = write_header(
+            payload_len,
+            manifest_offset,
+            manifest_len,
+            manifest_crc32,
+            0,
+            0,
+        );
+        let mut out = Vec::with_capacity(payload_len as usize);
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&self.body);
         out.extend_from_slice(&encoded);
-
-        let mut footer = [0u8; 64];
-        footer[0..8].copy_from_slice(&MAGIC);
-        footer[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-        footer[12..20].copy_from_slice(&manifest_offset.to_le_bytes());
-        footer[20..28].copy_from_slice(&manifest_len.to_le_bytes());
-        footer[28..32].copy_from_slice(&manifest_crc32.to_le_bytes());
-        let header_crc = crc32fast::hash(&footer[0..56]);
-        footer[56..60].copy_from_slice(&header_crc.to_le_bytes());
-        out.extend_from_slice(&footer);
         out
     }
 }
@@ -247,6 +257,31 @@ fn compress_brotli(data: &[u8]) -> Result<Vec<u8>, PackError> {
     Ok(out)
 }
 
+pub enum DetectedFormat {
+    V1 {
+        overlay: usize,
+        header: PayloadHeader,
+    },
+    V0 {
+        footer: Footer,
+    },
+}
+
+pub fn detect(data: &[u8]) -> Result<DetectedFormat, PackError> {
+    let overlay = overlay_start(data);
+    if let Ok(header) = read_payload_header(data, overlay) {
+        let payload_end = overlay
+            .checked_add(header.payload_len as usize)
+            .ok_or(PackError::Truncated)?;
+        if payload_end <= data.len() {
+            return Ok(DetectedFormat::V1 { overlay, header });
+        }
+        return Err(PackError::Truncated);
+    }
+    let footer = format::footer_v0(data)?;
+    Ok(DetectedFormat::V0 { footer })
+}
+
 pub fn read_footer(data: &[u8]) -> Result<Footer, PackError> {
     if data.len() < FOOTER_SIZE as usize {
         return Err(PackError::Truncated);
@@ -270,16 +305,30 @@ pub fn read_footer(data: &[u8]) -> Result<Footer, PackError> {
 }
 
 pub fn read_manifest(data: &[u8]) -> Result<PackManifest, PackError> {
-    let footer = read_footer(data)?;
-    let start = usize::try_from(footer.manifest_offset).map_err(|_| PackError::Truncated)?;
-    let end =
-        start.checked_add(usize::try_from(footer.manifest_len).map_err(|_| PackError::Truncated)?);
-    let end = end.ok_or(PackError::Truncated)?;
+    let (start, len, crc32) = match detect(data)? {
+        DetectedFormat::V1 { overlay, header } => {
+            if header.manifest_len > MAX_MANIFEST_LEN {
+                return Err(PackError::Truncated);
+            }
+            let start = overlay
+                .checked_add(header.manifest_offset as usize)
+                .ok_or(PackError::Truncated)?;
+            (start, header.manifest_len, header.manifest_crc32)
+        }
+        DetectedFormat::V0 { footer } => {
+            let start =
+                usize::try_from(footer.manifest_offset).map_err(|_| PackError::Truncated)?;
+            (start, footer.manifest_len, footer.manifest_crc32)
+        }
+    };
+    let end = start
+        .checked_add(usize::try_from(len).map_err(|_| PackError::Truncated)?)
+        .ok_or(PackError::Truncated)?;
     if end > data.len() {
         return Err(PackError::Truncated);
     }
     let encoded = &data[start..end];
-    if crc32fast::hash(encoded) != footer.manifest_crc32 {
+    if crc32fast::hash(encoded) != crc32 {
         return Err(PackError::Crc);
     }
     let m: PackManifest =
@@ -292,7 +341,14 @@ pub fn extract_file(
     m: &PackManifest,
     entry: &FileEntry,
 ) -> Result<Vec<u8>, PackError> {
-    let start = usize::try_from(entry.offset).map_err(|_| PackError::Truncated)?;
+    let base = match detect(data)? {
+        DetectedFormat::V1 { overlay, .. } => overlay,
+        DetectedFormat::V0 { .. } => 0,
+    };
+    let start = usize::try_from(entry.offset)
+        .map_err(|_| PackError::Truncated)?
+        .checked_add(base)
+        .ok_or(PackError::Truncated)?;
     let mut out = Vec::with_capacity(entry.size as usize);
     let mut consumed = 0u32;
     for i in 0..entry.chunk_count {
@@ -325,11 +381,35 @@ pub struct IntegrityReport {
 }
 
 pub fn verify_integrity(data: &[u8], m: &PackManifest) -> Result<IntegrityReport, PackError> {
+    if m.files.len() > MAX_FILES || m.chunks.len() > MAX_CHUNKS || bytes_total(m) > MAX_TOTAL_RAW {
+        return Err(PackError::Manifest("manifest exceeds format limits".into()));
+    }
+    for c in &m.chunks {
+        if c.raw_len as u64 > MAX_RAW_CHUNK {
+            return Err(PackError::Manifest("chunk raw_len exceeds limit".into()));
+        }
+    }
+    let detected = detect(data)?;
+    let (data_base, data_end) = match &detected {
+        DetectedFormat::V1 { overlay, header } => {
+            let end = overlay
+                .checked_add(header.payload_len as usize)
+                .ok_or(PackError::Truncated)?;
+            if end > data.len() {
+                return Err(PackError::Truncated);
+            }
+            (*overlay, end)
+        }
+        DetectedFormat::V0 { .. } => (0usize, data.len()),
+    };
     let mut used = vec![false; m.chunks.len()];
     let mut bytes_checked = 0u64;
     let mut body_end = 0u64;
     for (fi, entry) in m.files.iter().enumerate() {
-        let start = usize::try_from(entry.offset).map_err(|_| PackError::Truncated)?;
+        if entry.size > MAX_FILE_SIZE {
+            return Err(PackError::Manifest(format!("file {fi} exceeds size limit")));
+        }
+        let start = usize::try_from(entry.offset).map_err(|_| PackError::Truncated)? + data_base;
         let mut consumed = 0u32;
         let mut raw_this_file = 0u64;
         for i in 0..entry.chunk_count {
@@ -343,7 +423,7 @@ pub fn verify_integrity(data: &[u8], m: &PackManifest) -> Result<IntegrityReport
             let cend = cstart
                 .checked_add(chunk.comp_len as usize)
                 .ok_or(PackError::Truncated)?;
-            if cend > data.len() {
+            if cend > data_end {
                 return Err(PackError::Truncated);
             }
             let raw = decode_chunk(chunk.codec, &data[cstart..cend], chunk.raw_len as usize)?;
@@ -374,18 +454,35 @@ pub fn verify_integrity(data: &[u8], m: &PackManifest) -> Result<IntegrityReport
             )));
         }
     }
-    let footer = read_footer(data)?;
-    let manifest_end = footer
-        .manifest_offset
-        .checked_add(footer.manifest_len)
-        .ok_or(PackError::Truncated)?;
-    if manifest_end + FOOTER_SIZE != data.len() as u64 || body_end > footer.manifest_offset {
-        return Err(PackError::Truncated);
+    match &detected {
+        DetectedFormat::V1 { overlay, header } => {
+            let manifest_end = overlay
+                .checked_add((header.manifest_offset + header.manifest_len) as usize)
+                .ok_or(PackError::Truncated)?;
+            if body_end > (overlay + header.manifest_offset as usize) as u64 {
+                return Err(PackError::Truncated);
+            }
+            let _ = manifest_end;
+        }
+        DetectedFormat::V0 { footer } => {
+            let manifest_end = footer
+                .manifest_offset
+                .checked_add(footer.manifest_len)
+                .ok_or(PackError::Truncated)?;
+            if manifest_end + FOOTER_SIZE != data.len() as u64 || body_end > footer.manifest_offset
+            {
+                return Err(PackError::Truncated);
+            }
+        }
     }
     Ok(IntegrityReport {
         chunks_checked: m.chunks.len(),
         bytes_checked,
     })
+}
+
+fn bytes_total(m: &PackManifest) -> u64 {
+    m.files.iter().map(|f| f.size).sum()
 }
 
 fn decode_chunk(codec: u8, data: &[u8], raw_len: usize) -> Result<Vec<u8>, PackError> {
@@ -398,13 +495,15 @@ fn decode_chunk(codec: u8, data: &[u8], raw_len: usize) -> Result<Vec<u8>, PackE
         }
         CODEC_LZMA2 => {
             use std::io::Read;
+            let cap = raw_len.saturating_add(1);
             let mut reader = lzma_rust2::Lzma2Reader::new(
                 data,
                 lzma_rust2::LzmaOptions::DICT_SIZE_DEFAULT,
                 None,
             );
             let mut out = Vec::with_capacity(raw_len);
-            reader.read_to_end(&mut out)?;
+            let mut limited = (&mut reader).take(cap as u64);
+            limited.read_to_end(&mut out)?;
             if out.len() != raw_len {
                 return Err(PackError::Truncated);
             }
@@ -412,9 +511,11 @@ fn decode_chunk(codec: u8, data: &[u8], raw_len: usize) -> Result<Vec<u8>, PackE
         }
         CODEC_BROTLI => {
             use std::io::Read;
+            let cap = raw_len.saturating_add(1);
             let mut reader = brotli::Decompressor::new(data, 4096);
             let mut out = Vec::with_capacity(raw_len);
-            reader.read_to_end(&mut out)?;
+            let mut limited = (&mut reader).take(cap as u64);
+            limited.read_to_end(&mut out)?;
             if out.len() != raw_len {
                 return Err(PackError::Truncated);
             }
@@ -427,8 +528,8 @@ fn decode_chunk(codec: u8, data: &[u8], raw_len: usize) -> Result<Vec<u8>, PackE
 #[cfg(test)]
 mod tests {
     use super::{
-        AppMeta, CODEC_BROTLI, CODEC_LZMA2, CODEC_STORE, CodecPolicy, PackBuilder, PackError,
-        extract_file, read_footer, read_manifest, verify_integrity,
+        AppMeta, CODEC_BROTLI, CODEC_LZMA2, CODEC_STORE, CodecPolicy, PAYLOAD_FORMAT_VERSION,
+        PackBuilder, PackError, extract_file, locate, read_manifest, verify_integrity,
     };
 
     fn sample() -> Vec<u8> {
@@ -467,11 +568,13 @@ mod tests {
     }
 
     #[test]
-    fn footer_roundtrip() {
+    fn header_roundtrip() {
         let data = sample();
-        let f = read_footer(&data).unwrap();
-        assert_eq!(f.format_version, 1);
-        assert!(f.manifest_offset < data.len() as u64);
+        let (overlay, header) = locate(&data).unwrap();
+        assert_eq!(overlay, 0);
+        assert_eq!(header.format_version, PAYLOAD_FORMAT_VERSION);
+        assert_eq!(header.payload_len as usize, data.len());
+        assert!(header.manifest_offset < data.len() as u64);
     }
 
     #[test]
@@ -496,10 +599,12 @@ mod tests {
 
     #[test]
     fn corrupted_chunk_fails_hash() {
-        let mut data = sample();
-        data[2] ^= 0xff;
+        let data = sample();
         let m = read_manifest(&data).unwrap();
-        match extract_file(&data, &m, &m.files[0]) {
+        let mut corrupt = data.clone();
+        let first = m.files[0].offset as usize;
+        corrupt[first] ^= 0xff;
+        match extract_file(&corrupt, &m, &m.files[0]) {
             Err(e @ (PackError::Hash(_) | PackError::Crc)) => {
                 assert!(!e.to_string().is_empty());
             }
@@ -510,22 +615,33 @@ mod tests {
     #[test]
     fn bad_magic_rejected() {
         let mut data = sample();
-        let len = data.len();
-        data[len - 64] = b'X';
-        assert!(matches!(read_footer(&data), Err(PackError::BadMagic)));
+        data[0] = b'X';
+        assert!(matches!(
+            locate(&data),
+            Err(PackError::BadMagic) | Err(PackError::Crc)
+        ));
     }
 
     #[test]
-    fn base_offset_shifts_positions() {
-        let stub = vec![0u8; 1000];
-        let mut b = PackBuilder::new(stub.len() as u64);
-        b.add_file("a.txt", b"hello").unwrap();
-        let mut data = stub.clone();
-        data.extend_from_slice(&b.finish(&AppMeta::new("a", "a", "0.1.0")));
-        let f = read_footer(&data).unwrap();
-        assert!(f.manifest_offset >= 1000);
+    fn unsupported_version_rejected() {
+        let mut data = sample();
+        let v = PAYLOAD_FORMAT_VERSION + 1;
+        data[8..12].copy_from_slice(&v.to_le_bytes());
+        let new_crc = crc32fast::hash(&data[0..56]);
+        data[56..60].copy_from_slice(&new_crc.to_le_bytes());
+        assert!(matches!(
+            locate(&data),
+            Err(PackError::UnsupportedVersion(_))
+        ));
+    }
+
+    #[test]
+    fn trailing_bytes_after_payload_tolerated() {
+        let mut data = sample();
+        data.extend_from_slice(b"AUTHENTICODE-CERT-TABLE-SIMULATION");
         let m = read_manifest(&data).unwrap();
-        assert_eq!(extract_file(&data, &m, &m.files[0]).unwrap(), b"hello");
+        assert_eq!(m.files.len(), 2);
+        assert!(verify_integrity(&data, &m).is_ok());
     }
 
     #[test]
@@ -660,11 +776,12 @@ mod tests {
     fn integrity_detects_manifest_corruption() {
         let mut b = PackBuilder::new(0);
         b.add_file("a.bin", b"aaaa").unwrap();
-        let mut data = b.finish(&AppMeta::new("a", "a", "0.1.0"));
-        let f = read_footer(&data).unwrap();
-        let mi = f.manifest_offset as usize + 20;
-        data[mi] ^= 0xff;
-        assert!(read_manifest(&data).is_err());
+        let data = b.finish(&AppMeta::new("a", "a", "0.1.0"));
+        let (_, header) = locate(&data).unwrap();
+        let mut corrupt = data.clone();
+        let mi = header.manifest_offset as usize + 20;
+        corrupt[mi] ^= 0xff;
+        assert!(read_manifest(&corrupt).is_err());
     }
 
     #[test]
@@ -673,9 +790,9 @@ mod tests {
         b.add_file("a.bin", b"aaaa").unwrap();
         let data = b.finish(&AppMeta::new("a", "a", "0.1.0"));
         let m = read_manifest(&data).unwrap();
-        let mut extended = data.clone();
-        extended.push(0u8);
-        assert!(verify_integrity(&extended, &m).is_err());
+        let mut truncated = data.clone();
+        truncated.pop();
+        assert!(verify_integrity(&truncated, &m).is_err());
         assert!(verify_integrity(&data, &m).is_ok());
     }
 
