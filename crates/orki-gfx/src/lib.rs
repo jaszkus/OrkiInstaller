@@ -113,7 +113,9 @@ mod tests {
         assert_eq!(u.palette[0], [0.1, 0.2, 0.3, 1.0]);
         assert_eq!(u.params[3][0], 0.5);
         u.set_palette_color(9, [1.0; 4]);
-        assert_eq!(u.palette[9 - 2], [0.0; 4]);
+        assert_eq!(u.palette[7], [0.0; 4]);
+        u.set_param(8, [1.0; 4]);
+        assert_eq!(u.params[7], [0.0; 4]);
     }
 
     #[test]

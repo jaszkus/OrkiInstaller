@@ -181,7 +181,9 @@ mod tests {
     fn shader_progress_clamped() {
         let mut s = AuroraShader::new(0.5);
         s.set_progress(1.5);
+        assert_eq!(s.progress, 1.0);
         s.set_progress(-1.0);
+        assert_eq!(s.progress, 0.0);
     }
 
     #[test]

@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+file="$1"
+if grep -qiE "generated with|co-authored-by.*(codebuff|copilot|claude|openai|anthropic)" "$file"; then
+  echo "commit-msg: bot footers are not allowed in commit messages" >&2
+  exit 1
+fi
+exit 0
