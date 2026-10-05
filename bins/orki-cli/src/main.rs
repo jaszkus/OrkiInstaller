@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
@@ -18,7 +19,9 @@ fn run(args: &[String]) -> i32 {
         "check" => cmd_check(rest),
         "schema" => cmd_schema(rest),
         "doctor" => cmd_doctor(),
-        "pack" | "preview" | "sign" | "inspect" | "diff" | "test" | "release" => {
+        "pack" => cmd_pack(rest),
+        "preview" => cmd_preview(rest),
+        "sign" | "inspect" | "diff" | "test" | "release" => {
             eprintln!("{cmd}: not implemented yet (roadmap phase 1)");
             69
         }
@@ -38,6 +41,9 @@ fn print_usage() {
     println!("orki — installer builder");
     println!();
     println!("  wrap <app.exe> -o <Setup.exe> [--name N] [--id ID] [--version V]");
+    println!("  pack <dir> -o <out.orkipack> [--name N] [--id ID] [--version V]");
+    println!("      [--codec auto|store|lzma2|brotli]");
+    println!("  preview <out.orkipack>");
     println!("  init [--tauri <tauri.conf.json>]");
     println!("  check [orki.toml]");
     println!("  schema");
@@ -105,6 +111,180 @@ fn cmd_wrap(rest: &[String]) -> i32 {
         payload.len()
     );
     0
+}
+
+fn cmd_pack(rest: &[String]) -> i32 {
+    let mut positional: Vec<String> = Vec::new();
+    let mut out: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut id: Option<String> = None;
+    let mut version: Option<String> = None;
+    let mut codec_arg: Option<String> = None;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-o" | "--out" => out = it.next().cloned(),
+            "--name" => name = it.next().cloned(),
+            "--id" => id = it.next().cloned(),
+            "--version" => version = it.next().cloned(),
+            "--codec" => codec_arg = it.next().cloned(),
+            other => positional.push(other.to_string()),
+        }
+    }
+    let Some(source) = positional.first() else {
+        eprintln!("pack: source directory required");
+        return 2;
+    };
+    let dir = PathBuf::from(source);
+    if !dir.is_dir() {
+        eprintln!("pack: not a directory: {}", dir.display());
+        return 1;
+    }
+    let policy = match codec_arg.as_deref() {
+        None | Some("auto") => orki_pack::CodecPolicy::Auto,
+        Some("store") => orki_pack::CodecPolicy::Store,
+        Some("lzma2") => orki_pack::CodecPolicy::Lzma2,
+        Some("brotli") => orki_pack::CodecPolicy::Brotli,
+        Some(c) => {
+            eprintln!("pack: unknown codec: {c} (auto|store|lzma2|brotli)");
+            return 2;
+        }
+    };
+    let stem = dir
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("app")
+        .to_string();
+    let app_name = name.unwrap_or_else(|| stem.clone());
+    let app_id = id.unwrap_or_else(|| format!("com.example.{stem}"));
+    let app_version = version.unwrap_or_else(|| "0.0.0".to_string());
+
+    let mut files = Vec::new();
+    if let Err(e) = collect_files(&dir, &dir, &mut files) {
+        eprintln!("pack: cannot walk {}: {e}", dir.display());
+        return 1;
+    }
+    if files.is_empty() {
+        eprintln!("pack: no files in {}", dir.display());
+        return 1;
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut builder = orki_pack::PackBuilder::new(0).codec(policy);
+    let mut raw_total = 0u64;
+    for (rel, abs) in &files {
+        let data = match std::fs::read(abs) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("pack: cannot read {}: {e}", abs.display());
+                return 1;
+            }
+        };
+        raw_total += data.len() as u64;
+        if let Err(e) = builder.add_file(rel, &data) {
+            eprintln!("pack: {e}");
+            return 1;
+        }
+    }
+    let payload = builder.finish(&orki_pack::AppMeta::new(app_id, app_name, app_version));
+    let out_path = out
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("{stem}.orkipack")));
+    if let Err(e) = std::fs::write(&out_path, &payload) {
+        eprintln!("pack: cannot write {}: {e}", out_path.display());
+        return 1;
+    }
+    let ratio = if raw_total > 0 {
+        payload.len() as f64 / raw_total as f64
+    } else {
+        1.0
+    };
+    println!(
+        "wrote {} ({} files, {} bytes raw, {} bytes packed, ratio {:.2})",
+        out_path.display(),
+        files.len(),
+        raw_total,
+        payload.len(),
+        ratio
+    );
+    0
+}
+
+fn collect_files(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, PathBuf)>,
+) -> Result<(), std::io::Error> {
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        let p = e.path();
+        if p.is_dir() {
+            collect_files(root, &p, out)?;
+        } else if p.is_file() {
+            let rel = p
+                .strip_prefix(root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((rel, p));
+        }
+    }
+    Ok(())
+}
+
+fn cmd_preview(rest: &[String]) -> i32 {
+    let positional: Vec<&String> = rest.iter().filter(|a| !a.starts_with('-')).collect();
+    let Some(source) = positional.first() else {
+        eprintln!("preview: package path required");
+        return 2;
+    };
+    let data = match std::fs::read(source) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("preview: cannot read {source}: {e}");
+            return 1;
+        }
+    };
+    let m = match orki_pack::read_manifest(&data) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("preview: bad package: {e}");
+            return 1;
+        }
+    };
+    let raw: u64 = m.files.iter().map(|f| f.size).sum();
+    let packed: u64 = m.chunks.iter().map(|c| c.comp_len as u64).sum();
+    println!("package: {} {} ({})", m.app_name, m.app_version, m.app_id);
+    println!("files: {}, chunks: {}", m.files.len(), m.chunks.len());
+    let mut codec_counts: BTreeMap<u8, u32> = BTreeMap::new();
+    for c in &m.chunks {
+        *codec_counts.entry(c.codec).or_insert(0) += 1;
+    }
+    for (codec, n) in &codec_counts {
+        println!("codec {}: {} chunks", codec_name(*codec), n);
+    }
+    let ratio = if raw > 0 {
+        packed as f64 / raw as f64
+    } else {
+        1.0
+    };
+    println!("raw: {raw} bytes, packed: {packed} bytes, ratio: {ratio:.2}");
+    println!();
+    for f in &m.files {
+        println!("  {:>12}  {} ({} chunks)", f.size, f.path, f.chunk_count);
+    }
+    0
+}
+
+fn codec_name(codec: u8) -> &'static str {
+    match codec {
+        orki_pack::CODEC_STORE => "store",
+        orki_pack::CODEC_LZMA2 => "lzma2",
+        orki_pack::CODEC_BROTLI => "brotli",
+        orki_pack::CODEC_ZSTD => "zstd",
+        _ => "unknown",
+    }
 }
 
 fn cmd_init(rest: &[String]) -> i32 {

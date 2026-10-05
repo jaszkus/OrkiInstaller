@@ -12,6 +12,9 @@ crc32fast = { workspace = true }
 blake3 = { workspace = true }
 orki-core = { path = "../orki-core", version = "0.0.1" }
 thiserror = { workspace = true }
+fastcdc = "5"
+lzma-rust2 = "0.21"
+brotli = "9"
 
 [lints]
 workspace = true
