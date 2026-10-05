@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Payload format v1 specification (`docs/format.md`, draft for owner ratification): PE-overlay location tolerant of Authenticode, relative offsets, Ed25519 signature block, embedded config/assets sections, hard limits, and a fail-closed validation pipeline.
+- `orki-core`: manifest validation rejects `package.compression = "zstd"` with a clear message per ADR-0002 (codec id stays reserved).
+
 - Baseline report (`docs/reports/baseline.md`) capturing verified build/test state, dependency versions, 100% Rust audit results, and stub sizes; ADR-0001 (iced 0.14 + wgpu 27 pairing, no fork) and ADR-0002 (zstd deferred, codec id reserved).
 - `xtask check-history` (also part of `xtask ci`) and a `commit-msg` hook that reject commit messages containing bot footers (`Generated with`, `Co-authored-by` for bot identities); rule documented in `CONTRIBUTING.md`.
 - `CONTRIBUTING.md` documenting the English-only language policy for all repository artifacts, the no-comments rule for code files, and the contribution workflow.
