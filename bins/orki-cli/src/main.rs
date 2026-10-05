@@ -106,7 +106,7 @@ fn cmd_wrap(rest: &[String]) -> i32 {
         },
         None => Vec::new(),
     };
-    let mut builder = orki_pack::PackBuilder::new(stub_bytes.len() as u64);
+    let mut builder = orki_pack::PackBuilder::new(0);
     let dest_name = format!("{stem}.exe");
     if let Err(e) = builder.add_file(&dest_name, &data) {
         eprintln!("wrap: {e}");
@@ -194,11 +194,15 @@ fn cmd_pack(rest: &[String]) -> i32 {
     let app_id = id.unwrap_or_else(|| format!("com.example.{stem}"));
     let app_version = version.unwrap_or_else(|| "0.0.0".to_string());
 
+    let out_path = out
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("{stem}.orkipack")));
     let mut files = Vec::new();
     if let Err(e) = collect_files(&dir, &dir, &mut files) {
         eprintln!("pack: cannot walk {}: {e}", dir.display());
         return 1;
     }
+    files.retain(|(_, abs)| *abs != out_path);
     if files.is_empty() {
         eprintln!("pack: no files in {}", dir.display());
         return 1;
@@ -215,7 +219,7 @@ fn cmd_pack(rest: &[String]) -> i32 {
         },
         None => Vec::new(),
     };
-    let mut builder = orki_pack::PackBuilder::new(stub_bytes.len() as u64).codec(policy);
+    let mut builder = orki_pack::PackBuilder::new(0).codec(policy);
     let mut raw_total = 0u64;
     for (rel, abs) in &files {
         let data = match std::fs::read(abs) {
@@ -240,9 +244,6 @@ fn cmd_pack(rest: &[String]) -> i32 {
         eprintln!("pack: self-check failed: {e}");
         return 1;
     }
-    let out_path = out
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("{stem}.orkipack")));
     if let Err(e) = std::fs::write(&out_path, &final_bytes) {
         eprintln!("pack: cannot write {}: {e}", out_path.display());
         return 1;
@@ -352,16 +353,20 @@ fn cmd_inspect(rest: &[String]) -> i32 {
             return 1;
         }
     };
-    let f = match orki_pack::read_footer(&data) {
-        Ok(f) => f,
+    let (overlay, header) = match orki_pack::locate(&data) {
+        Ok(v) => v,
         Err(e) => {
-            eprintln!("inspect: FAIL footer: {e}");
+            eprintln!("inspect: FAIL header: {e}");
             return 1;
         }
     };
     match orki_pack::verify_integrity(&data, &m) {
         Ok(report) => {
-            println!("format: {}, footer: ok, manifest: ok", f.format_version);
+            let signed = header.flags & orki_pack::FLAG_SIGNED != 0;
+            println!(
+                "format: {}, overlay: {}, manifest: ok, signed: {}",
+                header.format_version, overlay, signed
+            );
             println!("app: {} {} ({})", m.app_name, m.app_version, m.app_id);
             println!("files: {}, chunks: {}", m.files.len(), m.chunks.len());
             println!(
