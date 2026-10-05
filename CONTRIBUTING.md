@@ -29,6 +29,10 @@ should instead rename things, split a function, or add a test.
 - Common types: `feat`, `fix`, `refactor`, `docs`, `chore`, `build`, `test`.
 - Squash merges are used on `main`; the squash commit message should follow the same
   format.
+- **No bot footers.** Commit messages must not contain `Generated with ...` lines or
+  `Co-authored-by` trailers pointing at bots (Codebuff, Copilot, Claude, and similar).
+  The `commit-msg` hook rejects them and `cargo xtask check-history` fails CI when one
+  slips through. Contributors are humans; Dependabot is the only exception.
 
 ## Development loop
 

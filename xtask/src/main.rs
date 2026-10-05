@@ -30,6 +30,7 @@ fn run(args: &[String]) -> i32 {
         "e2e" => cmd_e2e(rest),
         "ci" => cmd_ci(rest),
         "doctor" => cmd_doctor(rest),
+        "check-history" => cmd_check_history(rest),
         "help" | "--help" | "-h" => {
             print_help();
             0
@@ -54,6 +55,7 @@ fn print_help() {
     );
     println!("  size-budget --variant <V> [--profile <P>] [--target <T>]");
     println!("  audit-imports --variant <V> [--profile <P>] [--target <T>]");
+    println!("  check-history [<git-range>]");
     println!("  e2e");
     println!("  ci");
     println!("  doctor");
@@ -286,6 +288,9 @@ fn cmd_e2e(_rest: &[String]) -> i32 {
 }
 
 fn cmd_ci(_rest: &[String]) -> i32 {
+    if cmd_check_history(&[]) != 0 {
+        return 1;
+    }
     if cmd_lint(&[]) != 0 {
         return 1;
     }
@@ -471,4 +476,44 @@ fn flag_value(rest: &[String], name: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn cmd_check_history(rest: &[String]) -> i32 {
+    let range = rest
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "origin/main..HEAD".to_string());
+    let output = Command::new("git")
+        .args(["log", "--format=%B", &range])
+        .output();
+    let Ok(out) = output else {
+        eprintln!("check-history: cannot read git log for {range}, skipping");
+        return 0;
+    };
+    if !out.status.success() {
+        eprintln!("check-history: git log unavailable for {range} (shallow clone?), skipping");
+        return 0;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let offenders: Vec<&str> = text
+        .lines()
+        .filter(|l| {
+            let lower = l.to_lowercase();
+            lower.contains("generated with")
+                || (lower.starts_with("co-authored-by:")
+                    && ["codebuff", "copilot", "claude", "openai", "anthropic"]
+                        .iter()
+                        .any(|bot| lower.contains(bot)))
+        })
+        .collect();
+    if offenders.is_empty() {
+        println!("check-history: clean ({range})");
+        0
+    } else {
+        for l in &offenders {
+            eprintln!("forbidden commit footer: {l}");
+        }
+        eprintln!("check-history: FAILED ({range})");
+        1
+    }
 }

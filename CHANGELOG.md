@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Baseline report (`docs/reports/baseline.md`) capturing verified build/test state, dependency versions, 100% Rust audit results, and stub sizes; ADR-0001 (iced 0.14 + wgpu 27 pairing, no fork) and ADR-0002 (zstd deferred, codec id reserved).
+- `xtask check-history` (also part of `xtask ci`) and a `commit-msg` hook that reject commit messages containing bot footers (`Generated with`, `Co-authored-by` for bot identities); rule documented in `CONTRIBUTING.md`.
 - `CONTRIBUTING.md` documenting the English-only language policy for all repository artifacts, the no-comments rule for code files, and the contribution workflow.
 - `orki-pack`: `verify_integrity` for full-package verification (footer, manifest placement, chunk reachability, per-chunk BLAKE3 + CRC32, per-file raw-size accounting).
 - `orki` CLI: `inspect` command with a fail-fast integrity report (exit 1 on any corruption).
