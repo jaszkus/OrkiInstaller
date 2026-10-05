@@ -57,6 +57,11 @@ impl Manifest {
                 self.schema
             )));
         }
+        if self.package.compression == Compression::Zstd {
+            return Err(Error::Config(
+                "package.compression = zstd is reserved but not implemented yet (ADR-0002); use lzma2, brotli or store".to_string(),
+            ));
+        }
         if self.app.id.trim().is_empty() {
             return Err(Error::Config("app.id must not be empty".to_string()));
         }

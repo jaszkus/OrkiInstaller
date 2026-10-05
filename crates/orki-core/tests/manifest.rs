@@ -151,11 +151,20 @@ fn parses_full_sample() {
     assert_eq!(m.registry.len(), 1);
     assert_eq!(m.update.channel, "stable");
 }
-
 #[test]
 fn rejects_bad_schema() {
     let bad = SAMPLE.replace("schema = 1", "schema = 2");
     assert!(Manifest::parse(&bad).is_err());
+}
+
+#[test]
+fn rejects_zstd_compression() {
+    let bad = SAMPLE.replace("compression = \"lzma2\"", "compression = \"zstd\"");
+    let err = Manifest::parse(&bad).expect_err("zstd must be rejected");
+    assert!(
+        err.to_string().contains("zstd"),
+        "error should mention zstd: {err}"
+    );
 }
 
 #[test]
