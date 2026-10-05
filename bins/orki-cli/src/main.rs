@@ -22,7 +22,9 @@ fn run(args: &[String]) -> i32 {
         "pack" => cmd_pack(rest),
         "preview" => cmd_preview(rest),
         "inspect" => cmd_inspect(rest),
-        "sign" | "diff" | "test" | "release" => {
+        "keygen" => cmd_keygen(rest),
+        "sign" => cmd_sign(rest),
+        "diff" | "test" | "release" => {
             eprintln!("{cmd}: not implemented yet (roadmap phase 1)");
             69
         }
@@ -47,6 +49,8 @@ fn print_usage() {
     println!("  wrap <app.exe> accepts the same optional flags as pack");
     println!("  preview <out.orkipack>");
     println!("  inspect <Setup.exe|out.orkipack>");
+    println!("  keygen -o <keypair.txt>");
+    println!("  sign <pkg> -k <keypair.txt>");
     println!("  init [--tauri <tauri.conf.json>]");
     println!("  check [orki.toml]");
     println!("  schema");
@@ -380,6 +384,128 @@ fn cmd_inspect(rest: &[String]) -> i32 {
             1
         }
     }
+}
+
+fn cmd_keygen(rest: &[String]) -> i32 {
+    let mut out: Option<String> = None;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-o" | "--out" => out = it.next().cloned(),
+            other => {
+                eprintln!("keygen: unknown argument {other}");
+                return 2;
+            }
+        }
+    }
+    let mut seed = [0u8; 32];
+    if let Err(e) = getrandom::fill(&mut seed) {
+        eprintln!("keygen: os rng failure: {e}");
+        return 1;
+    }
+    let key = ed25519_seed_to_verifying_hex(&seed);
+    let path = out
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("keypair.txt"));
+    let content = format!(
+        "seed: {}\npubkey: {key}\n",
+        seed.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    );
+    if let Err(e) = std::fs::write(&path, content) {
+        eprintln!("keygen: cannot write {}: {e}", path.display());
+        return 1;
+    }
+    println!(
+        "keypair written to {} (keep the seed private, publish the pubkey)",
+        path.display()
+    );
+    0
+}
+
+fn ed25519_seed_to_verifying_hex(seed: &[u8; 32]) -> String {
+    use orki_pack::signature::pubkey_from_seed;
+    pubkey_from_seed(seed)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn load_signing_key(path: &str) -> Result<orki_pack::signature::SigningKey, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let seed_hex = text
+        .lines()
+        .find_map(|l| l.strip_prefix("seed: "))
+        .ok_or_else(|| format!("{path}: missing seed line"))?
+        .trim();
+    let seed = hex_decode_32(seed_hex).ok_or_else(|| format!("{path}: seed is not 32-byte hex"))?;
+    Ok(orki_pack::signature::SigningKey::from_bytes(&seed))
+}
+
+fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out[i] = ((hi << 4) | lo) as u8;
+    }
+    Some(out)
+}
+
+fn cmd_sign(rest: &[String]) -> i32 {
+    let mut positional: Vec<String> = Vec::new();
+    let mut key: Option<String> = None;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-k" | "--key" => key = it.next().cloned(),
+            other => positional.push(other.to_string()),
+        }
+    }
+    let Some(source) = positional.first() else {
+        eprintln!("sign: package path required");
+        return 2;
+    };
+    let Some(key) = key else {
+        eprintln!("sign: -k <keypair.txt> required");
+        return 2;
+    };
+    let signing = match load_signing_key(&key) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("sign: {e}");
+            return 1;
+        }
+    };
+    let mut data = match std::fs::read(source) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("sign: cannot read {source}: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = orki_pack::append_signature(&mut data, &signing, 0) {
+        eprintln!("sign: {e}");
+        return 1;
+    }
+    if let Err(e) = orki_pack::verify_payload_signature(
+        &data,
+        &[orki_pack::TrustedKey {
+            slot: 0,
+            pubkey: signing.verifying_key().to_bytes(),
+        }],
+    ) {
+        eprintln!("sign: self-check failed: {e}");
+        return 1;
+    }
+    if let Err(e) = std::fs::write(source, &data) {
+        eprintln!("sign: cannot write {source}: {e}");
+        return 1;
+    }
+    println!("signed {source} (key slot 0)");
+    0
 }
 
 fn codec_name(codec: u8) -> &'static str {

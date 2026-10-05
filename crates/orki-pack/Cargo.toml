@@ -15,6 +15,7 @@ thiserror = { workspace = true }
 fastcdc = "5"
 lzma-rust2 = "0.21"
 brotli = "9"
+ed25519-dalek = "3"
 
 [lints]
 workspace = true

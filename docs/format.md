@@ -1,8 +1,14 @@
 # OrkiInstaller payload format v1
 
-Status: **draft for owner ratification** (M1.1). Implementation follows only after this
-document is approved. Version 0 (the current prototype in `orki-pack`) is documented at
-the bottom for reference; v1 supersedes it.
+Status: **ratified by the owner** (2026-10-05). Decisions: exit code for signature
+failure per question 1 as proposed, unsigned payloads only under debug_assertions,
+Ed25519 via `ed25519-dalek`, independent chunks in v1.0 (solid blocks may arrive as a
+new codec id in v1.1), uninstaller section reserved but empty. All five may be revised
+in a future ADR without breaking the wire format. Version 0 (the current prototype in
+`orki-pack`) is documented at the bottom for reference; v1 supersedes it.
+
+Implementation is split into steps: (1) header/limits/PE location and reader/writer
+core, (2) Ed25519 signing, (3) streaming API, (4) fuzz targets.
 
 Source of truth for intent: `OrkiInstaller.md` section 5. This document freezes the
 byte-level contract. Any change after ratification requires a new ADR and a format
@@ -49,7 +55,7 @@ file whose "overlay" starts at offset 0 (the CLI `pack`/`wrap` output keeps work
 
 | offset | size | field |
 |---|---|---|
-| 0 | 8 | magic `ORKIHDR` |
+| 0 | 8 | magic `ORKIHDR\0` |
 | 1.. | | |
 | 8 | 4 | format_version (u32) = 1 |
 | 12 | 4 | header_size (u32) = 64 |
@@ -70,7 +76,7 @@ writes zero length and readers must skip it.
 
 | offset | size | field |
 |---|---|---|
-| 0 | 8 | magic `ORKISIG` |
+| 0 | 8 | magic `ORKISIG\0` |
 | 8 | 1 | algorithm = 1 (Ed25519) |
 | 9 | 1 | key_slot (0-255, which baked-in public key signed this payload) |
 | 10 | 2 | reserved |
@@ -153,21 +159,17 @@ chunk once and counts it per reference for accounting.
 - `orki inspect` reports: format version, signed/not, key slot, integrity, limits hit.
 - `orki preview` gains `--json` output for tooling.
 
-## Open questions for the owner (block implementation)
+## Owner decisions (ratified 2026-10-05)
 
-1. **Exit code for signature failure**: propose MSI 1621 (ERROR_INSTALL_LOG_FAILURE)
-   is not semantically right; better: define `ORKI-1003` -> exit 1621 as "signature
-   verification failed". ratify or propose different mapping.
-2. **Unsigned dev payloads**: OK to gate on `debug_assertions` in the stub?
-3. **Ed25519 crate choice**: `ed25519-dalek` 2.x (pure Rust, zeroize; no ring) —
-   confirm. It pulls `curve25519-dalek`; verify licenses (BSD-3) are acceptable for
-   the deny allowlist.
-4. **Solid blocks** (D4 from the review): v1.0 ships independent chunks (simplest,
-   delta-ready). A "solid group" of chunks compressed as one LZMA2 stream can be added
-   in v1.1 without breaking readers if encoded as a new codec id. Agree?
-5. **Uninstaller section**: v1.0 reserves the flag and writes nothing; the standalone
-   `orki-uninstall.exe` remains a build-time artifact copied next to the receipt (M4).
-   Agree?
+1. **Exit code for signature failure**: `ORKI-1003` maps to MSI exit 1621.
+2. **Unsigned dev payloads**: allowed only when the stub is built with
+   `debug_assertions`; release stubs reject unsigned payloads with `ORKI-1003`.
+3. **Ed25519 crate**: `ed25519-dalek` 2.x (pure Rust; licenses BSD-3/MIT pass the deny
+   allowlist).
+4. **Solid blocks**: deferred; v1.0 uses independent chunks. A future solid codec id
+   keeps readers compatible.
+5. **Uninstaller section**: flag reserved, section empty in v1.0; the standalone
+   `orki-uninstall.exe` ships as a build-time artifact in M4.
 
 ## Version 0 (current prototype) — kept for reference
 
