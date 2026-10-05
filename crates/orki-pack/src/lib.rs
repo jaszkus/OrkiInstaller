@@ -1,10 +1,15 @@
 pub mod format;
+pub mod signature;
 
 pub use format::{
     FLAG_HAS_ASSETS, FLAG_HAS_STRING_TABLE, FLAG_HAS_UNINSTALLER, FLAG_SIGNED, HEADER_MAGIC,
     HEADER_SIZE, MAX_ASSETS, MAX_CHUNKS, MAX_FILE_SIZE, MAX_FILES, MAX_MANIFEST_LEN,
     MAX_PATH_UTF16, MAX_RAW_CHUNK, MAX_TOTAL_RAW, PAYLOAD_FORMAT_VERSION, PayloadHeader,
     SIGNATURE_BLOCK_SIZE, locate, overlay_start, read_payload_header, write_header,
+};
+pub use signature::{
+    SigningKey, TrustedKey, append_signature, pubkey_from_seed, sign_message,
+    verify_payload_signature, write_signature_block,
 };
 
 pub const MAGIC: [u8; 8] = *b"ORKIPACK";
@@ -40,6 +45,12 @@ pub enum PackError {
     Io(#[from] std::io::Error),
     #[error("unsupported payload format version: {0}")]
     UnsupportedVersion(u32),
+    #[error("payload is not signed")]
+    UnsignedPayload,
+    #[error("signature verification failed (ORKI-1002)")]
+    SignatureMismatch,
+    #[error("signature key slot {0} is not trusted")]
+    UnknownKeySlot(u8),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -182,6 +193,23 @@ impl PackBuilder {
     }
 
     pub fn finish(self, meta: &AppMeta) -> Vec<u8> {
+        self.finish_inner(meta, None)
+    }
+
+    pub fn finish_signed(
+        self,
+        meta: &AppMeta,
+        key: &ed25519_dalek::SigningKey,
+        key_slot: u8,
+    ) -> Vec<u8> {
+        self.finish_inner(meta, Some((key, key_slot)))
+    }
+
+    fn finish_inner(
+        self,
+        meta: &AppMeta,
+        signing: Option<(&ed25519_dalek::SigningKey, u8)>,
+    ) -> Vec<u8> {
         let manifest = PackManifest {
             schema: 1,
             app_id: meta.id.clone(),
@@ -193,20 +221,30 @@ impl PackBuilder {
         let encoded = postcard::to_allocvec(&manifest).expect("postcard encode");
         let manifest_crc32 = crc32fast::hash(&encoded);
         let manifest_len = encoded.len() as u64;
+        let sig_len = if signing.is_some() {
+            SIGNATURE_BLOCK_SIZE as u64
+        } else {
+            0
+        };
         let manifest_offset = HEADER_SIZE as u64 + self.body.len() as u64;
-        let payload_len = manifest_offset + manifest_len;
+        let payload_len = manifest_offset + manifest_len + sig_len;
         let header = write_header(
             payload_len,
             manifest_offset,
             manifest_len,
             manifest_crc32,
-            0,
+            if signing.is_some() { FLAG_SIGNED } else { 0 },
             0,
         );
         let mut out = Vec::with_capacity(payload_len as usize);
         out.extend_from_slice(&header);
         out.extend_from_slice(&self.body);
         out.extend_from_slice(&encoded);
+        if let Some((key, slot)) = signing {
+            let sig = sign_message(key, &header[0..56], &encoded);
+            let block = write_signature_block(&sig.to_bytes(), slot);
+            out.extend_from_slice(&block);
+        }
         out
     }
 }

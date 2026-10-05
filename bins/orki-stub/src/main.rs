@@ -137,7 +137,7 @@ fn dispatch(args: &Args) -> i32 {
             }
             Err(e) => {
                 eprintln!("{e}");
-                1620
+                if e.contains("ORKI-1002") { 1621 } else { 1620 }
             }
         },
         Some(Mode::PrintConfig) => match read_self_manifest() {
@@ -173,7 +173,7 @@ fn dispatch(args: &Args) -> i32 {
             }
             Err(e) => {
                 eprintln!("{e}");
-                1620
+                if e.contains("ORKI-1002") { 1621 } else { 1620 }
             }
         },
     }
@@ -202,7 +202,51 @@ fn print_usage() {
 fn read_self_manifest() -> Result<orki_pack::PackManifest, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate own executable: {e}"))?;
     let data = std::fs::read(&exe).map_err(|e| format!("cannot read {}: {e}", exe.display()))?;
+    check_signature(&data)?;
     orki_pack::read_manifest(&data).map_err(|e| format!("bad package: {e}"))
+}
+
+fn trusted_keys() -> Vec<orki_pack::TrustedKey> {
+    let hex = match option_env!("ORKI_TRUSTED_PUBKEY") {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    let mut key = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        if chunk.len() != 2 || i >= 32 {
+            return Vec::new();
+        }
+        let hi = (chunk[0] as char).to_digit(16).unwrap_or(16) as u8;
+        let lo = (chunk[1] as char).to_digit(16).unwrap_or(16) as u8;
+        if hi > 15 || lo > 15 {
+            return Vec::new();
+        }
+        key[i] = (hi << 4) | lo;
+    }
+    vec![orki_pack::TrustedKey {
+        slot: 0,
+        pubkey: key,
+    }]
+}
+
+fn check_signature(data: &[u8]) -> Result<(), String> {
+    match orki_pack::verify_payload_signature(data, &trusted_keys()) {
+        Ok(()) => Ok(()),
+        Err(orki_pack::PackError::UnsignedPayload) => {
+            if cfg!(debug_assertions) {
+                Ok(())
+            } else {
+                Err("signature verification failed (ORKI-1002): unsigned payload".to_string())
+            }
+        }
+        Err(orki_pack::PackError::UnknownKeySlot(slot)) => Err(format!(
+            "signature verification failed (ORKI-1002): key slot {slot} is not trusted"
+        )),
+        Err(orki_pack::PackError::SignatureMismatch) => {
+            Err("signature verification failed (ORKI-1002)".to_string())
+        }
+        Err(e) => Err(format!("bad package: {e}")),
+    }
 }
 
 fn extract_to(dir: &std::path::Path) -> Result<usize, String> {

@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Ed25519 payload signing in `orki-pack` (128-byte `ORKISIG` block at the end of the v1 payload): deterministic signing over the first 56 header bytes plus the manifest, `verify_payload_signature` with key-slot lookup and fail-closed errors (`UnsignedPayload`, `UnknownKeySlot`, `SignatureMismatch`, `BadMagic`), and `append_signature` that flips `FLAG_SIGNED`, extends `payload_len`, refreshes the header CRC, and refuses double signing.
+- `orki` CLI: `keygen` (Ed25519 seed/pubkey pair to a text file via `getrandom`) and `sign` (in-place signing followed by a self-check against the signer's own pubkey).
+- `orki-stub`: signature gate before any manifest read — one trusted key compiled in via `ORKI_TRUSTED_PUBKEY` (hex, slot 0), unsigned payloads accepted only under `debug_assertions`, verification failures exit with `SIGNATURE_FAILURE` (1621).
+- `orki-core`: `SIGNATURE_FAILURE` exit code 1621 per `docs/format.md` decision D1.
+- `docs/format.md` ratified by the owner (decisions D1-D5: exit 1621 on ORKI-1002, unsigned packages only under debug assertions, ed25519-dalek, independent chunks in v1.0, uninstaller section reserved).
 - Payload format v1 implemented in `orki-pack` (spec in `docs/format.md`): 64-byte `ORKIHDR` payload header, offsets relative to the overlay start, PE-section-based payload location (Authenticode-tolerant), decompression caps (`raw_len + 1`), format hard limits enforced before allocation, unsupported-version rejection, and trailing-bytes tolerance for signature tables. Reader keeps read-only v0 footer compatibility; the writer emits v1 only.
 - `orki inspect` reports format version, overlay offset, signature state, and integrity; `orki pack`/`wrap` produce v1 payloads and self-check them before writing; `pack` excludes its own output file from the walk.
 

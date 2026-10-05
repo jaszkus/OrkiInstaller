@@ -15,6 +15,7 @@ orki-pack = { path = "../../crates/orki-pack", version = "0.0.1" }
 orki-tauri = { path = "../../crates/orki-tauri", version = "0.0.1" }
 orki-schema = { path = "../../crates/orki-schema", version = "0.0.1" }
 toml = { workspace = true }
+getrandom = "0.3"
 
 [dev-dependencies]
 orki-pack = { path = "../../crates/orki-pack", version = "0.0.1" }
