@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `CONTRIBUTING.md` documenting the English-only language policy for all repository artifacts, the no-comments rule for code files, and the contribution workflow.
+- `orki-pack`: `verify_integrity` for full-package verification (footer, manifest placement, chunk reachability, per-chunk BLAKE3 + CRC32, per-file raw-size accounting).
+- `orki` CLI: `inspect` command with a fail-fast integrity report (exit 1 on any corruption).
+- `orki` CLI: `--stub <path>` flag for `pack` and `wrap` that attaches a real stub binary as a PE overlay, producing a runnable `Setup.exe`; every build now self-checks footer, manifest, and chunk integrity before writing the output.
+
 - Workspace skeleton with pinned toolchain (`rust-toolchain.toml`), static CRT targets for x64 and ARM64, and shared lints.
 - `xtask` as the single source of truth for CI and local steps: `fmt`, `check`, `lint`, `test`, `build`, `size-budget`, `audit-imports`, `e2e`, `ci`, `doctor`, including a std-only PE import-table auditor and stub size budgets.
 - CI workflows: `ci` (lint, tests on windows-latest and windows-11-arm, stub variant builds with size/import gates, e2e smoke), `nightly` (dependency freshness), `release` (tag builds).

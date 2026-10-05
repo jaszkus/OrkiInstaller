@@ -67,6 +67,30 @@ fn run_cli(args: &[&str]) -> (i32, String) {
     (out.status.code().unwrap_or(-1), text)
 }
 
+fn stub_exe() -> String {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root");
+    let exe = if cfg!(windows) {
+        "orki-stub.exe"
+    } else {
+        "orki-stub"
+    };
+    let path = workspace.join("target").join("debug").join(exe);
+    if !path.is_file() {
+        let status = Command::new(env!("CARGO"))
+            .args(["build", "-p", "orki-stub"])
+            .current_dir(workspace)
+            .status()
+            .expect("run cargo build");
+        assert!(status.success(), "cargo build -p orki-stub failed");
+    }
+    assert!(path.is_file(), "stub not built: {}", path.display());
+    path.to_string_lossy().to_string()
+}
+
 #[test]
 fn pack_and_preview_roundtrip() {
     let tmp = TempDir::new("pack");
@@ -141,4 +165,109 @@ fn packbuilder_still_wraps_single_file() {
     let payload = b.finish(&AppMeta::new("a", "a", "0.1.0"));
     let m = read_manifest(&payload).unwrap();
     assert_eq!(m.files.len(), 1);
+}
+
+#[test]
+fn inspect_reports_ok_and_corruption() {
+    let tmp = TempDir::new("inspect");
+    let src = tmp.0.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"hello orki").unwrap();
+    let out_str = tmp.0.join("p.orkipack").to_string_lossy().to_string();
+    let src_str = src.to_string_lossy().to_string();
+    let (code, text) = run_cli(&["pack", &src_str, "-o", &out_str]);
+    assert_eq!(code, 0, "{text}");
+
+    let (code, text) = run_cli(&["inspect", &out_str]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("integrity: ok"), "{text}");
+
+    let mut data = fs::read(&out_str).unwrap();
+    let mid = data.len() / 2;
+    data[mid] ^= 0xff;
+    let corrupt = tmp.0.join("corrupt.orkipack");
+    fs::write(&corrupt, &data).unwrap();
+    let corrupt_str = corrupt.to_string_lossy().to_string();
+    let (code, text) = run_cli(&["inspect", &corrupt_str]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("FAIL"), "{text}");
+}
+
+#[test]
+fn pack_with_stub_produces_installable_exe() {
+    let tmp = TempDir::new("stub");
+    let src = tmp.0.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("app.exe"), b"app bytes here").unwrap();
+    let out = tmp.0.join("Setup.exe");
+    let out_str = out.to_string_lossy().to_string();
+    let src_str = src.to_string_lossy().to_string();
+    let stub = stub_exe();
+    let (code, text) = run_cli(&["pack", &src_str, "--stub", &stub, "-o", &out_str]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("stub attached"), "{text}");
+
+    let installer = fs::read(&out).unwrap();
+    let m = read_manifest(&installer).expect("manifest readable after overlay");
+    assert_eq!(
+        extract_file(&installer, &m, &m.files[0]).unwrap(),
+        b"app bytes here"
+    );
+
+    let headless = Command::new(&out)
+        .arg("--version")
+        .output()
+        .expect("run Setup.exe");
+    assert!(headless.status.success(), "--version failed");
+    assert!(
+        String::from_utf8_lossy(&headless.stdout).contains("orki-stub"),
+        "version output: {}",
+        String::from_utf8_lossy(&headless.stdout)
+    );
+    let list = Command::new(&out)
+        .arg("--list")
+        .output()
+        .expect("run Setup.exe");
+    assert!(list.status.success(), "--list failed on packed installer");
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains("app.exe"),
+        "--list output: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+}
+
+#[test]
+fn stub_is_built_for_tests() {
+    let p = stub_exe();
+    assert!(PathBuf::from(&p).is_file(), "{p}");
+}
+
+#[test]
+fn wrap_with_stub_attaches_overlay() {
+    let tmp = TempDir::new("wrap");
+    let app = tmp.0.join("hello.exe");
+    fs::write(&app, b"hello binary").unwrap();
+    let out = tmp.0.join("Setup.exe");
+    let out_str = out.to_string_lossy().to_string();
+    let app_str = app.to_string_lossy().to_string();
+    let (code, text) = run_cli(&[
+        "wrap",
+        &app_str,
+        "--stub",
+        &stub_exe(),
+        "-o",
+        &out_str,
+        "--name",
+        "Hello",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("stub attached"), "{text}");
+
+    let installer = fs::read(&out).unwrap();
+    let m = read_manifest(&installer).unwrap();
+    assert_eq!(m.app_name, "Hello");
+    assert_eq!(
+        extract_file(&installer, &m, &m.files[0]).unwrap(),
+        b"hello binary"
+    );
 }
