@@ -7,6 +7,12 @@ pub const CODEC_LZMA2: u8 = 1;
 pub const CODEC_BROTLI: u8 = 2;
 pub const CODEC_ZSTD: u8 = 3;
 
+pub const CHUNK_MIN: u32 = 16 * 1024;
+pub const CHUNK_AVG: u32 = 64 * 1024;
+pub const CHUNK_MAX: u32 = 256 * 1024;
+
+const MIN_AUTO_RAW: usize = 512;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PackError {
     #[error("bad magic")]
@@ -61,6 +67,14 @@ pub struct Footer {
     pub manifest_crc32: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecPolicy {
+    Auto,
+    Store,
+    Lzma2,
+    Brotli,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppMeta {
     pub id: String,
@@ -83,6 +97,7 @@ pub struct PackBuilder {
     body: Vec<u8>,
     chunks: Vec<Chunk>,
     files: Vec<FileEntry>,
+    codec: CodecPolicy,
 }
 
 impl Default for PackBuilder {
@@ -98,7 +113,13 @@ impl PackBuilder {
             body: Vec::new(),
             chunks: Vec::new(),
             files: Vec::new(),
+            codec: CodecPolicy::Auto,
         }
+    }
+
+    pub fn codec(mut self, policy: CodecPolicy) -> Self {
+        self.codec = policy;
+        self
     }
 
     pub fn add_file(&mut self, rel_path: &str, data: &[u8]) -> Result<(), PackError> {
@@ -110,22 +131,43 @@ impl PackBuilder {
         }
         let chunk_start = self.chunks.len() as u32;
         let offset = self.base + self.body.len() as u64;
-        let hash = blake3::hash(data);
-        let crc = crc32fast::hash(data);
-        self.body.extend_from_slice(data);
-        self.chunks.push(Chunk {
-            codec: CODEC_STORE,
-            comp_len: data.len() as u32,
-            raw_len: data.len() as u32,
-            blake3: hash.into(),
-            crc32: crc,
-        });
+        if data.is_empty() {
+            self.files.push(FileEntry {
+                path,
+                offset,
+                size: 0,
+                chunk_start,
+                chunk_count: 0,
+            });
+            return Ok(());
+        }
+        let mut count = 0u32;
+        for part in fastcdc::v2020::FastCDC::new(
+            data,
+            CHUNK_MIN as usize,
+            CHUNK_AVG as usize,
+            CHUNK_MAX as usize,
+        ) {
+            let raw = &data[part.offset..part.offset + part.length];
+            let hash = blake3::hash(raw);
+            let crc = crc32fast::hash(raw);
+            let (codec, comp) = encode_chunk(raw, self.codec)?;
+            self.body.extend_from_slice(&comp);
+            self.chunks.push(Chunk {
+                codec,
+                comp_len: comp.len() as u32,
+                raw_len: raw.len() as u32,
+                blake3: hash.into(),
+                crc32: crc,
+            });
+            count += 1;
+        }
         self.files.push(FileEntry {
             path,
             offset,
             size: data.len() as u64,
             chunk_start,
-            chunk_count: 1,
+            chunk_count: count,
         });
         Ok(())
     }
@@ -157,6 +199,52 @@ impl PackBuilder {
         out.extend_from_slice(&footer);
         out
     }
+}
+
+fn encode_chunk(data: &[u8], policy: CodecPolicy) -> Result<(u8, Vec<u8>), PackError> {
+    Ok(match policy {
+        CodecPolicy::Store => (CODEC_STORE, data.to_vec()),
+        CodecPolicy::Lzma2 => (CODEC_LZMA2, compress_lzma2(data)?),
+        CodecPolicy::Brotli => (CODEC_BROTLI, compress_brotli(data)?),
+        CodecPolicy::Auto => {
+            if data.len() < MIN_AUTO_RAW {
+                (CODEC_STORE, data.to_vec())
+            } else {
+                let lzma2 = compress_lzma2(data)?;
+                if lzma2.len() < data.len() {
+                    (CODEC_LZMA2, lzma2)
+                } else {
+                    let brotli_c = compress_brotli(data)?;
+                    if brotli_c.len() < data.len() {
+                        (CODEC_BROTLI, brotli_c)
+                    } else {
+                        (CODEC_STORE, data.to_vec())
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn compress_lzma2(data: &[u8]) -> Result<Vec<u8>, PackError> {
+    use std::io::Write;
+    let mut opts = lzma_rust2::Lzma2Options::with_preset(6);
+    opts.lzma_options.dict_size = lzma_rust2::LzmaOptions::DICT_SIZE_DEFAULT;
+    let mut out = Vec::with_capacity(data.len() / 2 + 64);
+    let mut writer = lzma_rust2::Lzma2Writer::new(&mut out, opts);
+    writer.write_all(data)?;
+    writer.finish()?;
+    Ok(out)
+}
+
+fn compress_brotli(data: &[u8]) -> Result<Vec<u8>, PackError> {
+    let params = brotli::enc::BrotliEncoderParams {
+        quality: 9,
+        ..Default::default()
+    };
+    let mut out = Vec::with_capacity(data.len() / 2 + 64);
+    brotli::BrotliCompress(&mut &data[..], &mut out, &params)?;
+    Ok(out)
 }
 
 pub fn read_footer(data: &[u8]) -> Result<Footer, PackError> {
@@ -239,19 +327,74 @@ fn decode_chunk(codec: u8, data: &[u8], raw_len: usize) -> Result<Vec<u8>, PackE
             }
             Ok(data.to_vec())
         }
+        CODEC_LZMA2 => {
+            use std::io::Read;
+            let mut reader = lzma_rust2::Lzma2Reader::new(
+                data,
+                lzma_rust2::LzmaOptions::DICT_SIZE_DEFAULT,
+                None,
+            );
+            let mut out = Vec::with_capacity(raw_len);
+            reader.read_to_end(&mut out)?;
+            if out.len() != raw_len {
+                return Err(PackError::Truncated);
+            }
+            Ok(out)
+        }
+        CODEC_BROTLI => {
+            use std::io::Read;
+            let mut reader = brotli::Decompressor::new(data, 4096);
+            let mut out = Vec::with_capacity(raw_len);
+            reader.read_to_end(&mut out)?;
+            if out.len() != raw_len {
+                return Err(PackError::Truncated);
+            }
+            Ok(out)
+        }
         other => Err(PackError::Codec(other)),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AppMeta, PackBuilder, PackError, extract_file, read_footer, read_manifest};
+    use super::{
+        AppMeta, CODEC_BROTLI, CODEC_LZMA2, CODEC_STORE, CodecPolicy, PackBuilder, PackError,
+        extract_file, read_footer, read_manifest,
+    };
 
     fn sample() -> Vec<u8> {
         let mut b = PackBuilder::new(0);
         b.add_file("my-app.exe", b"fake exe bytes").unwrap();
         b.add_file("resources/icon.png", &[1, 2, 3, 4, 5]).unwrap();
         b.finish(&AppMeta::new("com.example.myapp", "My App", "1.4.2"))
+    }
+
+    fn repetitive(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut x: u64 = 0x0451;
+        while out.len() < len {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let byte = (x >> 33) as u8;
+            for _ in 0..7 {
+                out.push(byte);
+            }
+        }
+        out.truncate(len);
+        out
+    }
+
+    fn incompressible(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut x: u64 = 0x9E3779B97F4A7C15;
+        while out.len() < len {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.push((x >> 33) as u8);
+        }
+        out
     }
 
     #[test]
@@ -314,5 +457,130 @@ mod tests {
         assert!(f.manifest_offset >= 1000);
         let m = read_manifest(&data).unwrap();
         assert_eq!(extract_file(&data, &m, &m.files[0]).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn large_file_is_multi_chunk() {
+        let big = repetitive(700 * 1024);
+        let mut b = PackBuilder::new(0);
+        b.add_file("assets/big.bin", &big).unwrap();
+        let data = b.finish(&AppMeta::new("a", "a", "0.1.0"));
+        let m = read_manifest(&data).unwrap();
+        assert!(m.files[0].chunk_count > 1);
+        let out = extract_file(&data, &m, &m.files[0]).unwrap();
+        assert_eq!(out, big);
+    }
+
+    #[test]
+    fn empty_file_roundtrip() {
+        let mut b = PackBuilder::new(0);
+        b.add_file("empty.lock", b"").unwrap();
+        b.add_file("real.txt", b"data").unwrap();
+        let data = b.finish(&AppMeta::new("a", "a", "0.1.0"));
+        let m = read_manifest(&data).unwrap();
+        assert_eq!(m.files[0].chunk_count, 0);
+        assert_eq!(extract_file(&data, &m, &m.files[0]).unwrap(), b"");
+        assert_eq!(extract_file(&data, &m, &m.files[1]).unwrap(), b"data");
+    }
+
+    #[test]
+    fn auto_stores_incompressible() {
+        let noise = incompressible(128 * 1024);
+        let mut b = PackBuilder::new(0).codec(CodecPolicy::Auto);
+        b.add_file("noise.bin", &noise).unwrap();
+        let data = b.finish(&AppMeta::new("a", "a", "0.1.0"));
+        let m = read_manifest(&data).unwrap();
+        let codecs: Vec<u8> = m.chunks.iter().map(|c| c.codec).collect();
+        assert!(
+            codecs.iter().all(|c| *c == CODEC_STORE),
+            "codecs: {codecs:?}"
+        );
+    }
+
+    #[test]
+    fn auto_compresses_repetitive_with_lzma2() {
+        let text = repetitive(300 * 1024);
+        let mut b = PackBuilder::new(0).codec(CodecPolicy::Auto);
+        b.add_file("text.bin", &text).unwrap();
+        let data = b.finish(&AppMeta::new("a", "a", "0.1.0"));
+        let m = read_manifest(&data).unwrap();
+        assert!(
+            m.chunks.iter().any(|c| c.codec == CODEC_LZMA2),
+            "expected lzma2 chunks"
+        );
+        assert!(data.len() < text.len());
+        let out = extract_file(&data, &m, &m.files[0]).unwrap();
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn forced_brotli_roundtrip() {
+        let text = repetitive(300 * 1024);
+        let mut b = PackBuilder::new(0).codec(CodecPolicy::Brotli);
+        b.add_file("text.bin", &text).unwrap();
+        let data = b.finish(&AppMeta::new("a", "a", "0.1.0"));
+        let m = read_manifest(&data).unwrap();
+        assert!(
+            m.chunks.iter().all(|c| c.codec == CODEC_BROTLI),
+            "expected brotli chunks"
+        );
+        let out = extract_file(&data, &m, &m.files[0]).unwrap();
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn forced_lzma2_roundtrip() {
+        let text = repetitive(300 * 1024);
+        let mut b = PackBuilder::new(0).codec(CodecPolicy::Lzma2);
+        b.add_file("text.bin", &text).unwrap();
+        let data = b.finish(&AppMeta::new("a", "a", "0.1.0"));
+        let m = read_manifest(&data).unwrap();
+        assert!(
+            m.chunks.iter().all(|c| c.codec == CODEC_LZMA2),
+            "expected lzma2 chunks"
+        );
+        let out = extract_file(&data, &m, &m.files[0]).unwrap();
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn deterministic_output() {
+        let build = || {
+            let mut b = PackBuilder::new(0);
+            b.add_file("my-app.exe", b"fake exe bytes").unwrap();
+            b.add_file("resources/icon.png", &[1, 2, 3, 4, 5]).unwrap();
+            b.finish(&AppMeta::new("com.example.myapp", "My App", "1.4.2"))
+        };
+        assert_eq!(build(), build());
+    }
+
+    #[test]
+    fn duplicate_path_rejected() {
+        let mut b = PackBuilder::new(0);
+        b.add_file("a.txt", b"1").unwrap();
+        assert!(b.add_file("a.txt", b"2").is_err());
+    }
+
+    #[test]
+    fn chunk_layout_is_contiguous() {
+        let big = repetitive(700 * 1024);
+        let mut b = PackBuilder::new(0).codec(CodecPolicy::Store);
+        b.add_file("big.bin", &big).unwrap();
+        let data = b.finish(&AppMeta::new("a", "a", "0.1.0"));
+        let m = read_manifest(&data).unwrap();
+        let f = &m.files[0];
+        assert!(f.chunk_count > 1);
+        let mut body_pos = f.offset as usize;
+        let mut raw_pos = 0usize;
+        for i in 0..f.chunk_count {
+            let c = &m.chunks[f.chunk_start as usize + i as usize];
+            assert_eq!(
+                &data[body_pos..body_pos + c.comp_len as usize],
+                &big[raw_pos..raw_pos + c.raw_len as usize]
+            );
+            body_pos += c.comp_len as usize;
+            raw_pos += c.raw_len as usize;
+        }
+        assert_eq!(raw_pos, big.len());
     }
 }
