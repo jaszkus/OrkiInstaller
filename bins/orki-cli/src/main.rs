@@ -21,7 +21,8 @@ fn run(args: &[String]) -> i32 {
         "doctor" => cmd_doctor(),
         "pack" => cmd_pack(rest),
         "preview" => cmd_preview(rest),
-        "sign" | "inspect" | "diff" | "test" | "release" => {
+        "inspect" => cmd_inspect(rest),
+        "sign" | "diff" | "test" | "release" => {
             eprintln!("{cmd}: not implemented yet (roadmap phase 1)");
             69
         }
@@ -42,8 +43,10 @@ fn print_usage() {
     println!();
     println!("  wrap <app.exe> -o <Setup.exe> [--name N] [--id ID] [--version V]");
     println!("  pack <dir> -o <out.orkipack> [--name N] [--id ID] [--version V]");
-    println!("      [--codec auto|store|lzma2|brotli]");
+    println!("      [--codec auto|store|lzma2|brotli] [--stub <orki-stub.exe>]");
+    println!("  wrap <app.exe> accepts the same optional flags as pack");
     println!("  preview <out.orkipack>");
+    println!("  inspect <Setup.exe|out.orkipack>");
     println!("  init [--tauri <tauri.conf.json>]");
     println!("  check [orki.toml]");
     println!("  schema");
@@ -56,6 +59,7 @@ fn cmd_wrap(rest: &[String]) -> i32 {
     let mut name: Option<String> = None;
     let mut id: Option<String> = None;
     let mut version: Option<String> = None;
+    let mut stub: Option<String> = None;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -63,6 +67,7 @@ fn cmd_wrap(rest: &[String]) -> i32 {
             "--name" => name = it.next().cloned(),
             "--id" => id = it.next().cloned(),
             "--version" => version = it.next().cloned(),
+            "--stub" => stub = it.next().cloned(),
             other => positional.push(other.to_string()),
         }
     }
@@ -91,24 +96,52 @@ fn cmd_wrap(rest: &[String]) -> i32 {
     let app_id = id.unwrap_or_else(|| format!("com.example.{stem}"));
     let app_version = version.unwrap_or_else(|| "0.0.0".to_string());
 
-    let mut builder = orki_pack::PackBuilder::new(0);
+    let stub_bytes = match &stub {
+        Some(p) => match std::fs::read(p) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("wrap: cannot read stub {p}: {e}");
+                return 1;
+            }
+        },
+        None => Vec::new(),
+    };
+    let mut builder = orki_pack::PackBuilder::new(stub_bytes.len() as u64);
     let dest_name = format!("{stem}.exe");
     if let Err(e) = builder.add_file(&dest_name, &data) {
         eprintln!("wrap: {e}");
         return 1;
     }
     let payload = builder.finish(&orki_pack::AppMeta::new(app_id, app_name, app_version));
+    let mut final_bytes = stub_bytes;
+    final_bytes.extend_from_slice(&payload);
     let out_path = out
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("Setup.exe"));
-    if let Err(e) = std::fs::write(&out_path, &payload) {
+    if let Err(e) = std::fs::write(&out_path, &final_bytes) {
         eprintln!("wrap: cannot write {}: {e}", out_path.display());
         return 1;
     }
+    let m = match orki_pack::read_manifest(&final_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("wrap: self-check failed: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = orki_pack::verify_integrity(&final_bytes, &m) {
+        eprintln!("wrap: self-check failed: {e}");
+        return 1;
+    }
+    let mode = if stub.is_some() {
+        "stub attached"
+    } else {
+        "payload only, no stub"
+    };
     println!(
-        "wrote {} ({} bytes, payload only, no stub attached)",
+        "wrote {} ({} bytes, {mode})",
         out_path.display(),
-        payload.len()
+        final_bytes.len()
     );
     0
 }
@@ -120,6 +153,7 @@ fn cmd_pack(rest: &[String]) -> i32 {
     let mut id: Option<String> = None;
     let mut version: Option<String> = None;
     let mut codec_arg: Option<String> = None;
+    let mut stub: Option<String> = None;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -128,6 +162,7 @@ fn cmd_pack(rest: &[String]) -> i32 {
             "--id" => id = it.next().cloned(),
             "--version" => version = it.next().cloned(),
             "--codec" => codec_arg = it.next().cloned(),
+            "--stub" => stub = it.next().cloned(),
             other => positional.push(other.to_string()),
         }
     }
@@ -170,7 +205,17 @@ fn cmd_pack(rest: &[String]) -> i32 {
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut builder = orki_pack::PackBuilder::new(0).codec(policy);
+    let stub_bytes = match &stub {
+        Some(p) => match std::fs::read(p) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("pack: cannot read stub {p}: {e}");
+                return 1;
+            }
+        },
+        None => Vec::new(),
+    };
+    let mut builder = orki_pack::PackBuilder::new(stub_bytes.len() as u64).codec(policy);
     let mut raw_total = 0u64;
     for (rel, abs) in &files {
         let data = match std::fs::read(abs) {
@@ -187,10 +232,18 @@ fn cmd_pack(rest: &[String]) -> i32 {
         }
     }
     let payload = builder.finish(&orki_pack::AppMeta::new(app_id, app_name, app_version));
+    let mut final_bytes = stub_bytes;
+    final_bytes.extend_from_slice(&payload);
+    if let Err(e) = orki_pack::read_manifest(&final_bytes)
+        .and_then(|m| orki_pack::verify_integrity(&final_bytes, &m))
+    {
+        eprintln!("pack: self-check failed: {e}");
+        return 1;
+    }
     let out_path = out
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("{stem}.orkipack")));
-    if let Err(e) = std::fs::write(&out_path, &payload) {
+    if let Err(e) = std::fs::write(&out_path, &final_bytes) {
         eprintln!("pack: cannot write {}: {e}", out_path.display());
         return 1;
     }
@@ -199,13 +252,15 @@ fn cmd_pack(rest: &[String]) -> i32 {
     } else {
         1.0
     };
+    let mode = if stub.is_some() {
+        format!("stub attached, {} bytes total", final_bytes.len())
+    } else {
+        format!("{} bytes", final_bytes.len())
+    };
     println!(
-        "wrote {} ({} files, {} bytes raw, {} bytes packed, ratio {:.2})",
+        "wrote {} ({} files, {raw_total} bytes raw, ratio {ratio:.2}, {mode})",
         out_path.display(),
         files.len(),
-        raw_total,
-        payload.len(),
-        ratio
     );
     0
 }
@@ -275,6 +330,51 @@ fn cmd_preview(rest: &[String]) -> i32 {
         println!("  {:>12}  {} ({} chunks)", f.size, f.path, f.chunk_count);
     }
     0
+}
+
+fn cmd_inspect(rest: &[String]) -> i32 {
+    let positional: Vec<&String> = rest.iter().filter(|a| !a.starts_with('-')).collect();
+    let Some(source) = positional.first() else {
+        eprintln!("inspect: package path required");
+        return 2;
+    };
+    let data = match std::fs::read(source) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("inspect: cannot read {source}: {e}");
+            return 1;
+        }
+    };
+    let m = match orki_pack::read_manifest(&data) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("inspect: FAIL manifest: {e}");
+            return 1;
+        }
+    };
+    let f = match orki_pack::read_footer(&data) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("inspect: FAIL footer: {e}");
+            return 1;
+        }
+    };
+    match orki_pack::verify_integrity(&data, &m) {
+        Ok(report) => {
+            println!("format: {}, footer: ok, manifest: ok", f.format_version);
+            println!("app: {} {} ({})", m.app_name, m.app_version, m.app_id);
+            println!("files: {}, chunks: {}", m.files.len(), m.chunks.len());
+            println!(
+                "integrity: ok ({} chunks, {} bytes verified)",
+                report.chunks_checked, report.bytes_checked
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("inspect: FAIL integrity: {e}");
+            1
+        }
+    }
 }
 
 fn codec_name(codec: u8) -> &'static str {

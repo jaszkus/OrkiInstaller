@@ -319,6 +319,75 @@ pub fn extract_file(
     Ok(out)
 }
 
+pub struct IntegrityReport {
+    pub chunks_checked: usize,
+    pub bytes_checked: u64,
+}
+
+pub fn verify_integrity(data: &[u8], m: &PackManifest) -> Result<IntegrityReport, PackError> {
+    let mut used = vec![false; m.chunks.len()];
+    let mut bytes_checked = 0u64;
+    let mut body_end = 0u64;
+    for (fi, entry) in m.files.iter().enumerate() {
+        let start = usize::try_from(entry.offset).map_err(|_| PackError::Truncated)?;
+        let mut consumed = 0u32;
+        let mut raw_this_file = 0u64;
+        for i in 0..entry.chunk_count {
+            let idx = (entry.chunk_start + i) as usize;
+            let chunk = m.chunks.get(idx).ok_or_else(|| {
+                PackError::Manifest(format!("file {fi} references missing chunk {idx}"))
+            })?;
+            let cstart = start
+                .checked_add(consumed as usize)
+                .ok_or(PackError::Truncated)?;
+            let cend = cstart
+                .checked_add(chunk.comp_len as usize)
+                .ok_or(PackError::Truncated)?;
+            if cend > data.len() {
+                return Err(PackError::Truncated);
+            }
+            let raw = decode_chunk(chunk.codec, &data[cstart..cend], chunk.raw_len as usize)?;
+            if blake3::hash(&raw).as_bytes() != &chunk.blake3 {
+                return Err(PackError::Hash(idx));
+            }
+            if crc32fast::hash(&raw) != chunk.crc32 {
+                return Err(PackError::Crc);
+            }
+            used[idx] = true;
+            consumed += chunk.comp_len;
+            raw_this_file += raw.len() as u64;
+            bytes_checked += raw.len() as u64;
+            body_end = body_end.max(cend as u64);
+        }
+        if entry.chunk_count == 0 {
+            if entry.size != 0 {
+                return Err(PackError::Truncated);
+            }
+        } else if raw_this_file != entry.size {
+            return Err(PackError::Truncated);
+        }
+    }
+    for (idx, u) in used.iter().enumerate() {
+        if !u {
+            return Err(PackError::Manifest(format!(
+                "chunk {idx} is not referenced"
+            )));
+        }
+    }
+    let footer = read_footer(data)?;
+    let manifest_end = footer
+        .manifest_offset
+        .checked_add(footer.manifest_len)
+        .ok_or(PackError::Truncated)?;
+    if manifest_end + FOOTER_SIZE != data.len() as u64 || body_end > footer.manifest_offset {
+        return Err(PackError::Truncated);
+    }
+    Ok(IntegrityReport {
+        chunks_checked: m.chunks.len(),
+        bytes_checked,
+    })
+}
+
 fn decode_chunk(codec: u8, data: &[u8], raw_len: usize) -> Result<Vec<u8>, PackError> {
     match codec {
         CODEC_STORE => {
@@ -359,7 +428,7 @@ fn decode_chunk(codec: u8, data: &[u8], raw_len: usize) -> Result<Vec<u8>, PackE
 mod tests {
     use super::{
         AppMeta, CODEC_BROTLI, CODEC_LZMA2, CODEC_STORE, CodecPolicy, PackBuilder, PackError,
-        extract_file, read_footer, read_manifest,
+        extract_file, read_footer, read_manifest, verify_integrity,
     };
 
     fn sample() -> Vec<u8> {
@@ -559,6 +628,55 @@ mod tests {
         let mut b = PackBuilder::new(0);
         b.add_file("a.txt", b"1").unwrap();
         assert!(b.add_file("a.txt", b"2").is_err());
+    }
+
+    #[test]
+    fn integrity_ok_on_valid_package() {
+        let big = repetitive(700 * 1024);
+        let mut b = PackBuilder::new(0);
+        b.add_file("big.bin", &big).unwrap();
+        b.add_file("small.txt", b"hello").unwrap();
+        let data = b.finish(&AppMeta::new("a", "a", "0.1.0"));
+        let m = read_manifest(&data).unwrap();
+        let report = verify_integrity(&data, &m).unwrap();
+        assert_eq!(report.chunks_checked, m.chunks.len());
+        assert_eq!(report.bytes_checked, 700 * 1024 + 5);
+    }
+
+    #[test]
+    fn integrity_detects_body_corruption() {
+        let mut b = PackBuilder::new(0);
+        b.add_file("data.bin", &repetitive(300 * 1024)).unwrap();
+        let data = b.finish(&AppMeta::new("a", "a", "0.1.0"));
+        let m = read_manifest(&data).unwrap();
+        let mut corrupt = data.clone();
+        let mid = m.files[0].offset as usize + 100;
+        corrupt[mid] ^= 0xff;
+        assert!(verify_integrity(&corrupt, &m).is_err());
+        assert!(verify_integrity(&data, &m).is_ok());
+    }
+
+    #[test]
+    fn integrity_detects_manifest_corruption() {
+        let mut b = PackBuilder::new(0);
+        b.add_file("a.bin", b"aaaa").unwrap();
+        let mut data = b.finish(&AppMeta::new("a", "a", "0.1.0"));
+        let f = read_footer(&data).unwrap();
+        let mi = f.manifest_offset as usize + 20;
+        data[mi] ^= 0xff;
+        assert!(read_manifest(&data).is_err());
+    }
+
+    #[test]
+    fn integrity_rejects_wrong_size_layout() {
+        let mut b = PackBuilder::new(0);
+        b.add_file("a.bin", b"aaaa").unwrap();
+        let data = b.finish(&AppMeta::new("a", "a", "0.1.0"));
+        let m = read_manifest(&data).unwrap();
+        let mut extended = data.clone();
+        extended.push(0u8);
+        assert!(verify_integrity(&extended, &m).is_err());
+        assert!(verify_integrity(&data, &m).is_ok());
     }
 
     #[test]
