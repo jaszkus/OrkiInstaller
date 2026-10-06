@@ -215,6 +215,7 @@ Block metadata (B1/Q4 model):
 ```text
 Block {
   codec: u8,                 0 store, 1 lzma2, 2 brotli, 3 zstd (reserved, rejected)
+  filter: u8,                0 none, 1 bcj-x86, 2 bcj-arm64 (PE-only pre-filter)
   comp_len: u32,
   raw_len: u32,
   comp_blake3: [u8; 32],     verified BEFORE decompression (A3)
@@ -236,6 +237,14 @@ Codec parameters (C4): LZMA2 dictionary size is recorded per payload in the mani
 (below); Brotli large windows are disabled at encode time and rejected at decode time
 (`lgwin <= 24`); `store` has no parameters. A decoder must be able to reconstruct every
 block from the manifest alone.
+
+Filter allowlist (C4): v1.0 has exactly two pre-filters, `bcj-x86` (id 1) and `bcj-arm64`
+(id 2), both length-preserving and applied only to PE input, selected by the PE `Machine`
+field (0x8664 -> bcj-x86, 0xAA64 -> bcj-arm64). Filter id 0 means no pre-filter. A filter id
+outside the allowlist, a filter applied to a non-PE file, or a filtered stream whose output
+length differs from the block's `raw_len` is ORKI-1001. The remaining `lzma-rust2` filters
+(ARM, ARM-Thumb, PPC, SPARC, IA64, RISC-V, BCJ2, delta) are deliberately not part of the
+format: each is attack surface with no payload benefit here.
 
 ### Validation pipeline (in order, fail closed)
 
@@ -285,18 +294,28 @@ eliminate or inline statics). Capacity: 4 slots.
 KeyEntry (40 bytes) {
   key_id: [u8; 8],          BLAKE3(pubkey)[0..8], lookup handle
   pubkey: [u8; 32],
-  valid_from: u64,          seconds since 1970 UTC, 0 = no start
-  valid_until: u64,         0 = no expiry
-  flags: u8,                bit 0: slot revoked
-  reserved: [u8; 7],        0
 }
 Section header: magic `ORKIKEY\0`, count u32, entries..., CRC32.
 ```
 
-Verification resolves `key_slot` from the signature block against this table, checks
-validity windows and the revoked flag, then verifies the signature. Key separation (Q3):
-the payload key, the Tauri updater key, and the remote-manifest key (14a) are distinct
-keys; nothing shares material across those roles.
+Verification resolves `key_slot` from the signature block against this table and verifies
+the signature; no key material, no verification.
+
+Key entries carry no validity window. The installer's clock is untrusted input, and an
+installer signed in 2026 must not stop working in 2031, so time-based expiry would buy no
+security while creating a real availability failure; expiry belongs to the update channel
+(14a), which can refuse new releases without invalidating installers that are already
+signed. Rotation is a stub rebuild: the new installer embeds a new or replaced `.orkikey`
+entry and is signed with the matching payload key. A key baked into an already-distributed
+installer cannot be revoked there, so the mitigations are one payload key per release line,
+key separation (below), offline custody of the private key, and a revocation list on the
+update channel for software the updater can still reach. Reading the section at runtime
+(instead of a compiled-in constant) also makes the verification path reachable by
+construction, so the linker cannot drop it: a stub with an empty key table is a
+template/dev build that refuses every payload (fail closed), and a stub with a key table
+always links the verification code. Key separation (Q3): the payload key, the Tauri updater
+key, and the remote-manifest key (14a) are distinct keys; nothing shares material across
+those roles.
 
 Private keys never enter the repository. `orki sign` accepts `--key <file>`,
 `--key env:VAR`, `--key stdin`, or `--key exec:<command>` (KMS/HSM integration); the file
@@ -318,6 +337,15 @@ what shipped). Conditions:
   present (`docs/reports/m1-stub-size.md`).
 - Deterministic Ed25519 is acceptable for payload signing; the signing key file format is
   the seed only (`seed: <hex>`), never an expanded key.
+
+### CLI surface (Q3, design section 7)
+
+Payload signing lives under distinct names so that `orki sign` stays reserved for
+external/updater signing (Authenticode, Tauri updater artifacts): `orki keygen` creates a
+signing key pair, `orki pack --sign-key <source>` signs the payload it just wrote (source is
+`file:`, `env:VAR`, `stdin`, or `exec:<command>` for KMS/HSM), and `orki verify <file>`
+re-runs the whole validation pipeline including the signature. `orki sign` is not part of
+payload packaging.
 
 ### Exit codes and error catalog (Q1, B5)
 
@@ -355,7 +383,7 @@ it as part of step 3.)
 | max total raw size | 8 GiB | 200_000 blocks x 40 KiB average bound (B6) |
 | max manifest_len | 64 MiB | ~35 MB at 100k files + 800k refs by estimate; 64 MiB is headroom |
 | max string table | 64 MiB | shares the manifest bound |
-| LZMA2 dict | LZMA2_MAX_DICT = 64 MiB | decoder-side cap; smaller values recorded per payload |
+| LZMA2 dict | LZMA2_MAX_DICT = 32 MiB | decoder-side cap; default dict = block size rounded up to a supported value; final value fixed by the block-size study |
 | Brotli window | lgwin <= 24 | large windows disabled |
 | block slack | comp_len <= raw_len + 1 KiB | incompressible input stored, not expanded |
 | decompression output | raw_len + 1 | bomb rejection |
@@ -363,6 +391,25 @@ it as part of step 3.)
 
 Block `comp_len` sums must not exceed the blocks region length; the partition check (A1)
 enforces it structurally.
+
+### Decoder memory budget (P0-3)
+
+Extraction is a streaming pipeline with a hard process-wide budget of 200 MiB, independent
+of payload size. Per-worker cost is dominated by the codec window, so parallelism is derived
+from the payload and never fixed:
+
+```text
+per_worker = dict_size + filter_buffers + 64 KiB range-decoder buffer   (LZMA2)
+workers    = max(1, min(logical_cores, floor((budget - fixed_overhead) / per_worker)))
+```
+
+The packer's default dictionary equals the block size rounded up to the next supported value
+(a dictionary larger than the block it decodes buys nothing) and never exceeds
+`LZMA2_MAX_DICT`. With 8 MiB blocks and a 200 MiB budget this is nowhere near the worker
+limit, so the parallel path is not memory-bound; a payload that forces `workers = 1` still
+decodes correctly, it only loses parallelism. The block-size study in
+`docs/reports/m1-compression.md` fixes the final default and confirms the budget on real
+payloads.
 
 ### Manifest budget (A5)
 
@@ -378,11 +425,18 @@ the bound comes from this pre-check, not from the deserializer.
 The uninstaller is part of the payload: a stub-only, independently signed PE embedded as
 its own section with a BLAKE3 hash in the signed manifest (`uninstaller_*` fields). The
 wire shape exists in v1.0; M4 decides when installers start embedding it. Repair and modify
-need a payload; the resolution: the installer is cached to `%ProgramData%\Orki\<app_id>\cache\`
-at install time (copy of `Setup.exe`), and repair/modify run from the cache, falling back to
-a user-provided `Setup.exe` path. Receipt paths are untrusted input for the elevated
-uninstaller: it re-sanitizes every path and constrains writes to the install directory;
-machine-scope receipts live under an ACL limited to administrators.
+need a payload; the resolution: the installer is cached at install time (copy of
+`Setup.exe`) and repair/modify run from the cache, falling back to a user-provided
+`Setup.exe` path. The cache location follows the install scope: user scope uses
+`%LOCALAPPDATA%\Orki\<app_id>\cache\`, machine scope uses
+`%ProgramData%\Orki\<app_id>\cache\` with an ACL limited to administrators. The cached
+copy is untrusted input and is re-verified in full (signature over the payload, section
+coverage, per-block hashes) before it is used; a failing copy is never repaired silently but
+reported and replaced from a user-provided installer. Caching can be disabled per package
+(no cache directory is created), which doubles the repair cost but keeps no payload on disk.
+Receipt paths are untrusted input for the elevated uninstaller: it re-sanitizes every path
+and constrains writes to the install directory; machine-scope receipts live under an ACL
+limited to administrators.
 
 ### Encryption (C6)
 
@@ -462,13 +516,22 @@ and 256 KiB chunks against 8 MiB solid blocks (with and without the BCJ x86 pre-
 measured on a real 515 MiB Electron-style payload with the production codec parameters.
 Methodology, environment, corpus fingerprint, results, and the decision thresholds live in
 `docs/reports/m1-compression.md`; numbers stay out of this specification so that no
-re-measurement can invalidate it. Result: the solid block model is 14.0-15.4% smaller than
-the 64 KiB independent-chunk baseline and 8.5-10.0% smaller than the best independent
-configuration measured (256 KiB auto-chunks); combined with the chunk-level hashing unit
-that the phase-3 delta artifact requires anyway, that settles the model: blocks are the
-v1.0 compression unit (B1/Q4). Default block size, the dictionary rule, stream grouping,
-the BCJ allowlist, and the Brotli-versus-LZMA2 policy are fixed in the compression decisions
-section of that report and enter this specification as decisions, not as measurements.
+re-measurement can invalidate it. Measured margins: 12.62% (dictionary-sized blocks) and
+14.05% (BCJ x86) against the **shipped v0 packer** measured on the same corpus, 14.0-15.4%
+against fixed 64 KiB chunks, and 8.48% / 9.97% against the best hypothetical independent
+configuration (256 KiB auto-chunks) — that last case is 0.03 points below the 10% target and
+is an improvement over production that nothing ships. BCJ x86 gains a further 2.12% on the
+PE subset (72% of the corpus) at no measurable time cost, so a default PE-only pre-filter
+meets its adoption criterion on this corpus. Blocks are the v1.0 compression
+unit (B1/Q4) on these grounds: (a) the reference baseline is the shipped 64 KiB chunking,
+where the win is above 14%; (b) 256 KiB chunks buy ratio by giving up delta granularity and
+decode parallelism, which the design needs elsewhere; (c) corpora with many small files,
+not measured yet, favour solid blocking further; and (d) the two-level model degenerates to
+the one-level model when a block holds a single chunk, so the decision is reversible in the
+direction that matters. The margin is re-checked on corpora 2 and 3 and after the block-size
+sweep; the default block size, dictionary rule, grouping policy, filter allowlist, and
+Brotli-versus-LZMA2 policy are fixed in the compression decisions section of that report and
+enter this specification as decisions, not as measurements.
 
 BCJ availability: `lzma-rust2` 0.21 ships x86/ARM/ARM64/ARM-Thumb/PPC/SPARC/IA64/RISC-V
 BCJ filters plus BCJ2 and delta (`lzma_rust2::filter::bcj::BcjWriter`/`BcjReader`), so the

@@ -36,6 +36,18 @@ policy, CI level, decode-side cost) — those wait for the extensions listed at 
 - Installed Electron-style desktop application (`@codebufffreebuff-desktop` under
   `%LOCALAPPDATA%\Programs`) as a stand-in for a Tauri app payload.
 - Selection: regular files >= 64 KiB — 131 files, 540 106 180 B (515.1 MiB) raw.
+- Composition by class (PE detected by the `MZ`/`PE\0\0` header and the `Machine` field):
+
+  | class | files | bytes | share |
+  |---|---|---|---|
+  | PE x64 | 11 | 388 620 032 | 71.9% |
+  | PE x86 | 2 | 328 136 | 0.1% |
+  | web (JS/CSS/HTML/JSON/SVG/map/XML/WASM) | 43 | 44 841 870 | 8.3% |
+  | media / already compressed | 71 | 66 104 296 | 12.2% |
+  | rest | 4 | 40 211 846 | 7.4% |
+
+  PE total: 13 files, 388 948 168 B (72.0% of the corpus). Corpus 1 is therefore
+  native-code dominated, which matters for the BCJ reading below.
 - Listing fingerprint: BLAKE3 over the sorted `size<TAB>relative-path` listing of the corpus
   = `d0ee3a74d52110e0877cfb30847fccaf30c6a5f805bba1bc5a061da5f17fb82a`.
 - Known bias: the >= 64 KiB filter drops small files, which is where solid blocking gains the
@@ -65,13 +77,17 @@ Relative size reduction against the independent baselines:
 
 | comparison | reduction |
 |---|---|
+| production packer vs fresh A (fixed 64 KiB, lzma2) | 1.6% |
 | C vs A (256 KiB chunks vs 64 KiB chunks) | 6.0% |
 | D / E vs A (solid 8 MiB, dict 64/8 MiB) | 14.0% |
 | F vs A (solid 8 MiB + BCJ) | 15.4% |
 | G vs A (per file + BCJ) | 18.3% |
-| D / E vs C (best independent configuration) | 8.5% |
-| F vs C | 10.0% |
+| D / E vs C (best independent configuration) | 8.48% |
+| F vs C | 9.97% |
 | G vs C | 13.1% |
+| **D / E vs production packer** | **12.62%** |
+| **F vs production packer** | **14.05%** |
+| **G vs production packer** | **16.99%** |
 
 Raw tool output (one line per variant; `comp` is the summed codec payload):
 
@@ -85,18 +101,90 @@ variant=F units=65 unit=8MiB raw=540106180 comp=175828111 pct=32.55 time_s=114.4
 variant=G units=131 unit=per-file raw=540106180 comp=169801341 pct=31.44 time_s=303.2 files=131 mix=lzma2:131,brotli:0,store:0 verify=ok
 ```
 
+## Production baseline (real v0 packer)
+
+Owner requirement (2026-10-06 review): variant A/B must reflect the shipped packer, not a
+reconstruction. The baseline was produced by the actual production code: commit `ca90b02`
+(PR #10, the last commit carrying the v0 writer) built with
+`cargo build --release -p orki-cli`, then
+`orki pack app -o app-v0.orkipack` over the same staged corpus (a temporary worktree, no
+repository change).
+
+That code chunked with FastCDC v2020 (min 16 KiB, average 64 KiB, max 256 KiB), hashed each
+chunk with BLAKE3 and CRC32, encoded with the same auto policy the tool mirrors (LZMA2
+preset 6 with an 8 MiB dictionary, then Brotli q9 if smaller, then store if smaller, store
+for anything below 512 B), and concatenated the compressed chunk payloads without any
+per-chunk framing; chunk lengths, hashes, and order live in the postcard manifest.
+
+| metric | value |
+|---|---|
+| wall time | 333 s (single process) |
+| chunks | 6 636 |
+| realized chunk raw sizes | min 854 B, p50 76 271 B, mean 81 390 B, max 262 144 B |
+| codec mix | lzma2 6 329, brotli 131, store 176 |
+| sum of compressed chunk payloads | 204 565 331 B (37.88% of raw) |
+| manifest + 64 B footer | 295 480 B (0.14% of the payload) |
+| packed file | 204 860 811 B |
+
+The realized mean chunk (81.4 KiB) sits above the nominal 64 KiB because FastCDC cuts when
+the mask fires, and the mask targets the average over the distribution; the minimum of
+854 B shows how far individual cuts can fall below it.
+
+### What the old run's numbers were
+
+The chunked numbers from the lost 2026-10-05 run (A 224 327 819 B, B 224 263 182 B,
+C 209 473 827 B) are **not reproducible** in any configuration measured now: fixed 64 KiB
+chunks give 207.8 MB and the production packer gives 204.6 MB, both far below 224 MB. The
+solid variants, by contrast, reproduced byte-identically (D 178 747 172 B, E 178 747 837 B),
+so codec settings, solid blocking, and the summation rule were the same code. The
+difference is therefore confined to the chunked path, and the most plausible cause is a
+chunker configuration with a smaller effective unit (or a per-chunk dictionary/state cost)
+— consistent with that run also being about seven times slower per variant. The old
+chunked figures are withdrawn and are not used in any margin.
+
+Checked one by one, the owner's hypotheses: LZMA2 options — identical (preset 6, dict
+8 MiB), and the identical solid results prove it; chunker — production FastCDC beats fixed
+64 KiB by 1.6%, so a *worse* chunked result requires smaller units, not bounds like
+production's; auto policy — the same policy on both sides, and it moves the total by 0.02%
+(B vs A), so it cannot explain 16 MB; per-chunk framing — production adds only the
+295 KB manifest/footer (0.14%) and nothing per chunk in the payload; "compressed bytes" —
+both the tool and the report mean the summed codec payload, with the container reported
+separately.
+
+## BCJ on PE files only (corpus 1, PE subset)
+
+The corpus-wide F-vs-E reading (1.63%) dilutes the filter over the 28% of bytes that are
+not native code, because the first run applied BCJ to the concatenated stream. To measure
+the owner's criterion (>= 2% on the PE group, <= 10% slowdown) directly, the same tool
+build ran the E and F configurations over a staged subset of the 13 PE files
+(388 948 168 B, 72.0% of the corpus):
+
+| variant | compressed | % of PE raw | encode time |
+|---|---|---|---|
+| E, 8 MiB blocks, dict 8 MiB | 132 493 115 B | 34.06% | 118.6 s |
+| F, 8 MiB blocks, BCJ x86 + dict 8 MiB | 129 689 906 B | 33.34% | 107.7 s |
+
+Result: **2.12% smaller on the PE bytes with no slowdown** (the BCJ pass is a
+length-preserving preprocessing step; F measured faster within run noise). Cross-check: the
+same delta applied to the full corpus predicts 1.57% overall, and the whole-corpus
+measurement showed 1.63%, which is consistent. The adoption criterion for a default BCJ on
+PE input is therefore met on this corpus; the decision itself is the owner's, and the
+planned PE/ARM64 corpus in the extensions repeats it for ARM64 binaries.
+
 ## Reading of the results
 
 - Model: solid blocking is the smaller representation, but the margin depends on the
-  baseline. Against the 64 KiB chunking that matches the shipped v0 behaviour (A/B) the
-  gain is 14.0-15.4%; against the best independent configuration measured (C, 256 KiB auto)
-  it is 8.5% (D/E) to 10.0% (F) — at the owner's >= 10% bar, not comfortably above it.
+  baseline. Against the shipped packer (measured, not reconstructed) the gain is 12.62%
+  (D/E) to 14.05% (F), so the owner's >= 10% bar is met against production. Against the best
+  independent configuration measured (C, 256 KiB auto, a hypothetical improvement over
+  production) it is 8.48% (D/E) and 9.97% (F) — formally 0.03 points below the bar in that
+  best case, which is why the spec records the justification for keeping the block model
+  instead of silently rounding toward the threshold.
 - Dictionary rule: D (dict 64 MiB) and E (dict 8 MiB) differ by 665 B out of 178.7 MB on
   8 MiB blocks. An 8 MiB block cannot use more than 8 MiB of window, so the dictionary can
   be sized to the block and decoder memory stays at dict x threads.
-- BCJ x86: -1.63% (E -> F) at no measurable time cost (114.4 s vs 117.9 s). Corpus 1 mixes
-  JavaScript/HTML/JSON with native code, so it under-represents the owner's >= 2% adoption
-  threshold for native-code payloads; a PE-dominated corpus is in the extensions.
+- BCJ x86: -1.63% (E -> F) across the whole corpus and **-2.12% on the PE subset**, at no
+  measurable time cost (see the dedicated section above).
 - Brotli q9 rarely beats LZMA2 p6 here: B selects it for 181 of 8242 chunks, C for 5 of 2061.
   Store fallback fires for 179 (B) and 69 (C) chunks, so incompressible data exists in the
   corpus. Both numbers are corpus-specific, not a policy.
