@@ -1,4 +1,5 @@
 {
+  "brotli_max_lgwin": 22,
   "generated_by": "docs/examples/v1-vectors.py",
   "schema": 1,
   "tools": {
@@ -105,7 +106,7 @@
       "id": "V6",
       "lzma2_dict_size": 0,
       "lzma2_lclppb": null,
-      "note": "large-window Brotli bitstream (window 25 > 24); rejected before decoding",
+      "note": "large-window Brotli bitstream (window 25, above BROTLI_MAX_LGWIN 22); rejected before decoding",
       "raw_blake3": null,
       "raw_file": null,
       "raw_len": 32768
@@ -143,6 +144,40 @@
       "note": "Brotli quality 9, the smallest window bits and the shortest WBITS prefix",
       "raw_blake3": "5d688cddfa113d42458192420d33e6d054f53c883304a86ffa9dd9c4b7eebc67",
       "raw_file": "input.app.bin",
+      "raw_len": 32768
+    },
+    {
+      "codec": "lzma2",
+      "codec_id": 1,
+      "comp_blake3": "bf03fe2f979389d2061a9f6331f1ee6fd069d1b01522b0d3187e44c267d4358d",
+      "comp_file": "lzma2-x86-nonpe.bin",
+      "comp_len": 733,
+      "expect": "ok",
+      "filter": "bcj-x86",
+      "filter_id": 1,
+      "id": "V9",
+      "lzma2_dict_size": 8388608,
+      "lzma2_lclppb": 93,
+      "note": "bcj-x86 on non-PE bytes: a filter is a length-preserving bijection over arbitrary content",
+      "raw_blake3": "5d688cddfa113d42458192420d33e6d054f53c883304a86ffa9dd9c4b7eebc67",
+      "raw_file": "input.app.bin",
+      "raw_len": 32768
+    },
+    {
+      "codec": "brotli",
+      "codec_id": 2,
+      "comp_blake3": "ff51747c035f3f9d253d009071bd93bbd28d22254774a98bca9ea6cf546a5599",
+      "comp_file": "brotli-w23.bin",
+      "comp_len": 1302,
+      "expect": "ORKI-1001",
+      "filter": "none",
+      "filter_id": 0,
+      "id": "V10",
+      "lzma2_dict_size": 0,
+      "lzma2_lclppb": null,
+      "note": "window bits 23, above BROTLI_MAX_LGWIN (22); rejected from the stream header",
+      "raw_blake3": null,
+      "raw_file": null,
       "raw_len": 32768
     }
   ],

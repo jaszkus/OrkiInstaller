@@ -1,4 +1,5 @@
 import hashlib
+import lzma
 import os
 import shutil
 import struct
@@ -32,19 +33,42 @@ def blake3_tool():
         path = shutil.which(candidate)
         if path:
             return path
-    sys.exit("v1-example-check: need b3sum (or BLAKE3_BIN) to compute BLAKE3 digests")
+    return None
 
 
 BLAKE3 = blake3_tool()
+try:
+    import blake3 as blake3_module
+except ImportError:
+    blake3_module = None
+if blake3_module is None and BLAKE3 is None:
+    sys.exit("v1-example-check: need the blake3 Python module, b3sum, or BLAKE3_BIN")
+
+BCJ_DICT = 1 << 20
 
 
 def blake3(data, tag="digest"):
+    if blake3_module is not None:
+        return blake3_module.blake3(data).digest()
     path = os.path.join(HERE, f".{tag}.tmp")
     with open(path, "wb") as fh:
         fh.write(data)
     out = subprocess.run([BLAKE3, path], capture_output=True, check=True, text=True).stdout
     os.remove(path)
     return bytes.fromhex(out.split()[0])
+
+
+def inverse_bcj_x86(data):
+    chain = lzma.compress(
+        data,
+        format=lzma.FORMAT_RAW,
+        filters=[{"id": lzma.FILTER_LZMA2, "preset": 6, "dict_size": BCJ_DICT}],
+    )
+    return lzma.decompress(
+        chain,
+        format=lzma.FORMAT_RAW,
+        filters=[{"id": lzma.FILTER_X86}, {"id": lzma.FILTER_LZMA2, "dict_size": BCJ_DICT}],
+    )
 
 
 def varint_at(buf, pos):
@@ -248,6 +272,13 @@ def parse_payload(payload):
         require(comp_len <= raw_len + 1024, "block slack")
         if filt:
             require(comp_len == raw_len, "filter is length preserving")
+            require(codec == 0, "the examples filter store blocks only")
+            unfiltered = inverse_bcj_x86(blob)
+            require(len(unfiltered) == raw_len, "inverse filter length")
+            require(
+                blake3(unfiltered, "unfiltered") == raw_hash,
+                "raw_blake3 after the inverse filter",
+            )
         elif codec == 0:
             require(blake3(blob, "raw") == raw_hash, "raw_blake3")
         cursor += comp_len
@@ -275,14 +306,44 @@ def parse_payload(payload):
     return report
 
 
+PINNED = {
+    "v1-example-1.bin": {
+        "payload_len": 454,
+        "manifest_offset": 102,
+        "manifest_len": 213,
+        "blocks_offset": 315,
+        "header_crc32": 0x330A711E,
+        "sig_digest": "bbf60e4a35fb491e7be719f7db70cb28c13e5e3060fcd2d375a87dad684404a8",
+        "sha256": "01b810338574d3427746520c90806b6dd982c2fc27a99efe7bb76c746a4816f2",
+    },
+    "v1-example-2.bin": {
+        "payload_len": 1252,
+        "manifest_offset": 132,
+        "manifest_len": 374,
+        "blocks_offset": 612,
+        "header_crc32": 0x03D849C9,
+        "sig_digest": "31d72217d028a1edbed1e63a9c9ad16f08088c76fa400d988de54d4e4d0738a3",
+        "sha256": "b90f795d8f1981c8b33456f34288c828f95f0d363bfe38fa4fcd5f928156f124",
+    },
+}
+
+
 def check(payload, label):
     report = validate(payload)
+    mismatches = []
+    for key, value in PINNED.get(label, {}).items():
+        if report[key] != value:
+            mismatches.append(f"{key}: got {report[key]}, spec pins {value}")
     print(f"{label}: OK")
     for name, start, end in report.pop("sections"):
         print(f"  section {name}: offset={start} len={end - start}")
     report.pop("positions")
     for key, value in report.items():
         print(f"  {key}={value}")
+    for mismatch in mismatches:
+        print(f"  PINNED FAIL {mismatch}")
+    if mismatches:
+        sys.exit(f"v1-example-check: {label} does not match the values pinned in docs/format.md")
     return report
 
 

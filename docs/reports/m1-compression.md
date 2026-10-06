@@ -12,7 +12,7 @@ policy, CI level, decode-side cost) — those wait for the extensions listed at 
 
 ## Method
 
-- Tool: a scratch Rust binary (`orki-ratio`, release build) that uses the production codec
+- Tool: a scratch Rust binary outside the repository (release build) that uses the production codec
   path: `lzma-rust2` 0.21 `Lzma2Options::with_preset(6)` with a per-variant dictionary,
   `brotli` 9 (`BrotliEncoderParams { quality: 9 }`), the packer's auto policy (LZMA2 first,
   then Brotli, then store; store below 512 B raw), and
@@ -288,3 +288,15 @@ semantics of `package.level`.
   from all sizes (measured separately under item h).
 - Corpus 1 is a developer tool installation, not a Tauri app; declared as a proxy, replaced
   by corpus 2 for the parameter decisions.
+
+## Whole-process memory target (informational)
+
+The specification's 200 MiB budget bounds the decoder: worker buffers, codec state, and
+per-block buffers, as derived in `docs/format.md` ("Decoder memory budget"). It is not a
+process limit. The informational target for a whole run is the decoder formula plus the
+stub's own baseline working set, and the T13 harness measures both in one pass: the decoder
+peak must satisfy `peak <= formula` (and the 200 MiB budget), while the whole-process peak is
+recorded per worker count and per medium (decode to memory, extract to the NVMe system
+volume, extract to a spinning-disk secondary volume) together with the CPU model and the
+physical/logical core count. No normative limit is set for the whole process; a harness
+result may only tighten the formula's constants, never widen the budget.

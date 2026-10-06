@@ -4,7 +4,10 @@ Status: **rc2 — draft for owner ratification** (2026-10-05). The 2026-10-05 ra
 the earlier draft is withdrawn; that draft had security gaps (unauthenticated payload
 regions, downgrade via the signed flag, decompression before authentication) and internal
 contradictions. Implementation is frozen at step 2 (Ed25519 signing over header+manifest,
-already merged in PR #12) and must not advance until this revision is ratified.
+already merged in PR #12) and must not advance until this revision is ratified. Ratification
+records an exact commit: the owner comments `RATIFIED @ <SHA>` on the PR and merges it, and
+the decision log gains a row quoting that SHA in the follow-up docs commit, because adding
+the row earlier would change the SHA being ratified.
 
 Scope of this revision (owner review 2026-10-05):
 
@@ -53,7 +56,8 @@ budget, manifest and string-table bounds), the error catalog, and the validation
 Changing any of those requires an ADR and a format-version bump.
 
 Packer policy is deliberately **not** normative: the default block size, stream grouping and
-ordering, whether a filter is applied by default and to which architectures, the
+ordering, whether a filter is applied by default, to which architectures, and which blocks
+are filtered (a block that mixes PE and non-PE bytes is not filtered), the
 Brotli-versus-LZMA2 choice, the compression preset per profile, and the store-detection
 heuristic. Policy lives in `docs/reports/m1-compression.md` and can change without
 re-ratifying this document as long as every payload it produces satisfies the rules above; a
@@ -262,10 +266,11 @@ inverse-filtered length, and `raw_len` are all equal.
 - A filter is applied per block to that block's own raw bytes, with the filter position base
 at 0; blocks decode independently, so a file may cross a block boundary and the blocks it
 occupies are filtered or not filtered independently of each other.
-- A block with `filter != 0` must be covered exclusively by file records that carry a
-`pe_version` (the packer sets it only for PE inputs), and its inverse-filtered output must
-start with `MZ`. Anything else is ORKI-1001 (D15). This is the enforceable form of
-"applied only to PE input": a block that mixes PE and non-PE content must not be filtered.
+- A filter may be applied to any block, whatever its content: every allowlisted filter is a
+length-preserving bijection over arbitrary bytes, so it is safe without the reader knowing
+what the bytes mean. Whether a block is filtered is therefore a packer decision and never a
+reader check (D15): the packer filters only blocks whose bytes belong exclusively to PE
+input, selected by the PE `Machine` field, and the reader never inspects file types.
 
 Asset kinds (C3): 0 theme, 1 font, 2 icon, 3 license, 4 i18n, 5 shader, 6 image,
 7 script, 8 plugin, 9 uninstaller (only valid in the uninstaller section; rejected
@@ -278,12 +283,14 @@ Codec parameters (C4): LZMA2 dictionary size is recorded per payload in the mani
 block from the manifest alone.
 
 Filter allowlist (C4): v1.0 has exactly two pre-filters, `bcj-x86` (id 1) and `bcj-arm64`
-(id 2), both length-preserving and applied only to PE input, selected by the PE `Machine`
-field (0x8664 -> bcj-x86, 0xAA64 -> bcj-arm64). Filter id 0 means no pre-filter. A filter id
-outside the allowlist, a filter applied to a block that is not covered exclusively by PE
-file records, a filtered block whose inverse-filtered output does not start with `MZ`, or a
-filtered stream whose output length differs from the block's `raw_len` is ORKI-1001 (D15).
-The filter position base is 0 for every block (see "Hash and filter semantics"). The
+(id 2), both length-preserving bijections over arbitrary bytes. Filter id 0 means no
+pre-filter. A filter id outside the allowlist, or a filtered stream whose output length
+differs from the block's `raw_len`, is ORKI-1001. Which blocks are filtered is packer policy
+(see "Normative content vs packer policy"): the packer filters only blocks whose bytes
+belong exclusively to PE input, selected by the PE `Machine` field (0x8664 -> bcj-x86,
+0xAA64 -> bcj-arm64), and groups PE files into their own blocks; the reader never derives
+this from the payload (D15). The filter position base is 0 for every block (see "Hash and
+filter semantics"). The
 remaining `lzma-rust2` filters (ARM, ARM-Thumb, PPC, SPARC, IA64, RISC-V, BCJ2, delta) are
 deliberately not part of the format: each is attack surface with no payload benefit here.
 
@@ -425,7 +432,7 @@ it as part of step 3.)
 | max manifest_len | 64 MiB | ~35 MB at 100k files + 800k refs by estimate; 64 MiB is headroom |
 | max string table | 64 MiB | shares the manifest bound |
 | LZMA2 dict | LZMA2_MAX_DICT = 32 MiB | reader limit derived from the 200 MiB extraction budget: the worst legal combination (32 MiB dictionary with a 16 MiB block) costs 64.2 MiB per worker, so two workers plus the fixed overhead stay inside the budget and the derived worker count is 3 (see "Decoder memory budget"); packer default dict = block size rounded up to a supported value |
-| Brotli window | lgwin <= 24 | large windows disabled |
+| Brotli window | lgwin <= 22 (BROTLI_MAX_LGWIN) | reader limit checked from the stream header before decoding (2^22 = 4 MiB window per worker); the RFC allows 24 and the large-window bitstream beyond it, and the Rust decoder accepts both, so the check is the reader's (D16) |
 | block slack | comp_len <= raw_len + 1 KiB | incompressible input stored, not expanded |
 | decompression output | raw_len + 1 | bomb rejection |
 | signature block | 128 B fixed | |
@@ -435,20 +442,26 @@ enforces it structurally.
 
 ### Decoder memory budget (P0-3, D8)
 
-Extraction is a streaming pipeline with a hard process-wide budget of 200 MiB, independent of
-payload size. The budget is enforced **by construction from the format's own limits**, not
+Extraction is a streaming pipeline with a hard **decoder** budget of 200 MiB, independent of
+payload size. The budget bounds the memory the extraction workers allocate (dictionaries,
+codec state, block buffers), not the whole process; the whole-process peak of a headless run
+is reported next to it as an informational number (decoder formula plus the stub's own
+baseline, measured by the same T13) and carries no normative limit. The budget is enforced
+**by construction from the format's own limits**, not
 from a measurement on one machine: every per-worker buffer is either a constant or bounded by
 `raw_len`, and `raw_len` is bounded by the maximum raw block size.
 
 ```text
-dict        = (dict_size + 15) & ~15                   LZMA2 dictionary window
+window      = (dict_size + 15) & ~15                   LZMA2 dictionary window
+              or 1 << lgwin (<= 4 MiB)                 Brotli ring buffer, lgwin <= BROTLI_MAX_LGWIN
 codec_state = 64 KiB range-decoder buffer + 40 KiB     lzma-rust2 get_memory_usage()
+              or Huffman tables + bookkeeping          brotli-decompressor, bounded constant
 filter      = 4 KiB                                    bcj filter buffer, when filter != 0
 comp_buffer = max_raw_block + COMPRESSION_SLACK        stored bytes of one block
 out_buffer  = max_raw_block + 1                        decompression cap (bomb rejection)
 thread      = 64 KiB stack + bookkeeping
 
-per_worker  = dict + codec_state + filter + comp_buffer + out_buffer + thread
+per_worker  = window + codec_state + filter + comp_buffer + out_buffer + thread
 workers     = max(1, min(logical_cores, floor((budget - fixed_overhead) / per_worker)))
 ```
 
@@ -468,6 +481,14 @@ lzma-rust2 keeps them inside its fixed 40 KiB term (next to the 64 KiB compresse
 buffer), and its LZMA2 property decoding rejects any stream with `lc + lp > 4` or
 `props > (4 * 5 + 4) * 9 + 8` (`lzma2_reader.rs::decode_lzma2_props`, `get_memory_usage`;
 `filter/bcj.rs::FILTER_BUF_SIZE = 4096`), so no payload can enlarge them.
+
+A Brotli worker allocates its ring buffer as `1 << window_bits` (`brotli-decompressor`
+`decode.rs`: `ringbuffer_size = 1 << s.window_bits`) plus fixed Huffman tables, so with
+`BROTLI_MAX_LGWIN = 22` a Brotli block costs at most about 4 MiB of window, well below the
+LZMA2 worst case, and the budget arithmetic does not change with the codec. The same crate
+enables the large-window mode by default (`BrotliState::new` sets `large_window = true`;
+only `new_strict` disables it), which is why the reader's own `WBITS` check is the control
+rather than the decoder configuration.
 
 The constants above come from this arithmetic, not from a measurement (D8). A measurement of
 peak working set has exactly one job: verifying that the formula really is an upper bound
@@ -537,7 +558,8 @@ which includes the whole plan, every path, and every block digest.
 | D12 | the payload fingerprint is the verified `sig_digest`, not a stored manifest field (circular dependency found by the worked example) | 2026-10-06 | accepted |
 | D13 | v1.0 carries no per-chunk (CDC) records: no chunk table in the manifest, block-level `comp_blake3`/`raw_blake3` as the integrity unit inside a block, delta readiness moved to the chunk-addressed phase-3 artifact | 2026-10-06 | accepted |
 | D14 | stub size budgets: full release 6.94 MiB, full ci 7.97 MiB; lite and headless from their own measurement plus 15%; alarm when a variant grows more than 5% against `main`; the size gate builds with a trusted key present, and `xtask/budgets.toml` is updated in the implementation PRs | 2026-10-06 | accepted |
-| D15 | a block with `filter != 0` must be covered exclusively by PE file records and must inverse-filter to a stream starting with `MZ`; the filter position base is 0 per block | 2026-10-06 | proposed (surfaced by example 2, needs owner confirmation) |
+| D15 | a block with `filter != 0` must be covered exclusively by PE file records and must inverse-filter to a stream starting with `MZ` | 2026-10-06 | rejected by the owner: a BCJ filter is a length-preserving bijection over arbitrary bytes, so filtering non-PE content is safe; a large PE spans blocks whose continuation blocks do not start with `MZ`, so the rule would have removed the filter from 72% of the corpus; filtering is packer policy (PE-only blocks), never a reader check |
+| D16 | Brotli window limit `BROTLI_MAX_LGWIN` = 22, validated from the stream header before decoding; the decoder is created without relying on large-window mode | 2026-10-06 | accepted |
 
 ## Traceability matrix
 
@@ -696,15 +718,15 @@ raw range `[340, 512)`). The PE-like file therefore crosses the block boundary a
 | 0 | store | bcj-x86 | 256 | 256 | `d40c5d2844d54faaa304ac031dfb166dc0f2f6efc137974cdd1b39cadd3d2106` | `d10ae3425b9de06e1088dbf4116c9a042641e8cbf84519a179d52e722129f959` |
 | 1 | store | none | 256 | 256 | `9f31569691a3b2bc6985f116355712c952236d46752cfbcdf3c85ccfd6dff2cc` | `9f31569691a3b2bc6985f116355712c952236d46752cfbcdf3c85ccfd6dff2cc` |
 
-Block 0 is covered exclusively by the PE file record, so it carries the `bcj-x86` pre-filter;
-block 1 mixes the PE tail with `app/a.bin`, so it must not be filtered (D15). The two hashes
+Block 0 is covered exclusively by the PE file record, so the packer filters it; block 1 mixes
+the PE tail with `app/a.bin`, so packer policy keeps it unfiltered. The two hashes
 differ exactly where the filter acted: `comp_blake3` covers the filtered bytes the codec sees,
 `raw_blake3` covers the unfiltered bytes the file records address. Regenerate with
 `python v1-example.py` and re-validate with `python v1-example-check.py`.
 
 ### Decoder vectors
 
-`docs/examples/vectors/` holds eight block payloads with metadata in
+`docs/examples/vectors/` holds ten block payloads with metadata in
 `docs/examples/v1-vectors.json`; `docs/examples/v1-vectors-check.py` decodes every positive
 vector with independent tooling (xz 5.8.3, brotli 1.2.0, and Python's liblzma binding) and
 asserts the declared length, `raw_blake3`, and the stream's own parameters. The format defines
@@ -719,25 +741,27 @@ that is re-recorded consciously when a codec version changes.
 | V3 | brotli | none | window bits 22 | 32768 | decodes |
 | V4 | lzma2 | none | dictionary 32 MiB (`LZMA2_MAX_DICT`) | 32768 | decodes |
 | V5 | lzma2 | none | dictionary 1 MiB | 4096 | ORKI-1001: first chunk declares 1048575 bytes |
-| V6 | brotli | none | large window 25 | 32768 | ORKI-1001: window above 24 |
+| V6 | brotli | none | large window 25 | 32768 | ORKI-1001: window above 22 |
 | V7 | lzma2 | none | dictionary 64 MiB | 32768 | ORKI-1001: dictionary above `LZMA2_MAX_DICT` |
 | V8 | brotli | none | window bits 16 | 32768 | decodes |
+| V9 | lzma2 | bcj-x86 | dictionary 8 MiB | 32768 | decodes: the filter acts on non-PE bytes (D15) |
+| V10 | brotli | none | window bits 23 | 32768 | ORKI-1001: window above `BROTLI_MAX_LGWIN` |
 
-Two consequences of these vectors are normative:
+Two of these vectors pin reader rules:
 
-- An LZMA2 stream bounds its own output: the first chunk header declares the uncompressed
-  size it will produce, so a reader can reject a decompression bomb as ORKI-1001 from the
-  header alone, before allocating anything (V5). The `raw_len + 1` output cap remains the
-  second line of defence for streams whose chunks are each small enough but whose total is
-  not.
-- A large-window Brotli bitstream is **not** rejected by the decoder libraries this project
-  links: brotli 1.2.0 accepts `--large_window=25`, and the Rust `brotli` crate used by
-  `orki-pack` decodes the same stream (`brotli::Decompressor` returns the full output). A
-  v1.0 reader must therefore validate the window bits of a Brotli block **before** handing it
-  to the decoder, by reading the stream's `WBITS` prefix: `1` -> 16 bits; `0` then a non-zero
-  3-bit `n` -> `17 + n`; `0 000` then `000` -> 17; `0 000` then `001` -> the incompatible
-  large-window bitstream. Any value above 24 is ORKI-1001 (V6); the decoder alone cannot be
-  trusted to enforce `lgwin <= 24`.
+- The `raw_len + 1` output cap is the primary bomb defence: a reader stops and reports
+  ORKI-1001 the moment the decompressed size would exceed it. Because an LZMA2 chunk header
+  declares the uncompressed size that chunk will produce, the reader applies the same rule
+  earlier and cheaper: a chunk whose declared size exceeds the remaining block budget is
+  rejected before its bytes reach the decoder (V5). The cap stays in force for streams whose
+  chunks are each small enough but whose total is not.
+- The Brotli window bits are validated from the stream header **before** decoding, against
+  `BROTLI_MAX_LGWIN` = 22: `1` -> 16; `0` then a non-zero 3-bit `n` -> `17 + n`; `0 000` then
+  `000` -> 17; `0 000` then `001` -> the incompatible large-window bitstream. Anything above
+  22, and every large-window bitstream, is ORKI-1001 (V6, V10). The decoder cannot be trusted
+  with this: brotli 1.2.0 accepts `--large_window=25`, and brotli-decompressor 6.0.1 — the
+  crate `orki-pack` links — enables the large-window mode by default, so a v1.0 reader checks
+  the header itself and never relies on decoder configuration.
 
 ### Negative vectors
 
@@ -785,8 +809,10 @@ Writing these examples changed the format four times. The manifest had no `block
 carry the `Block` records that `block_count` announces (added). `payload_fingerprint` was
 defined as a hash of the digest inside the region that digest covers (circular; the field is
 removed and C5 now defines the fingerprint as the verified digest itself). The filter record
-forced D15, because "applied only to PE input" was unenforceable while a block could mix PE
-and non-PE content. And the two block hashes needed a stated subject: `comp_blake3` covers
+raised the question of what constrains a filtered block; the proposed reader rule was
+rejected (D15) because a BCJ filter is a length-preserving bijection over arbitrary bytes,
+so the only reader obligations are the allowlist, the length rule, and `raw_blake3` after
+the inverse filter. And the two block hashes needed a stated subject: `comp_blake3` covers
 the stored (filtered) bytes, `raw_blake3` covers the raw byte range after the inverse filter.
 
 ## Acceptance criteria for the v1 implementation PRs
@@ -821,16 +847,17 @@ the stored (filtered) bytes, `raw_blake3` covers the raw byte range after the in
   (`docs/reports/m1-stub-size.md`).
 - Cross-domain replay test: a signature produced for the remote-manifest context fails
   payload verification and vice versa.
-- Decoder vectors: the eight vectors in `docs/examples/v1-vectors.json` decode to their
-  declared length and `raw_blake3` with external tooling, and the two negative cases (V5
-  output cap, V6 large window) are rejected before allocation or decoding.
+- Decoder vectors: the ten vectors in `docs/examples/v1-vectors.json` decode to their
+  declared length and `raw_blake3`, and the negative cases (V5 output cap, V6 and V10 window
+  limits, V7 dictionary limit) are rejected before allocation or decoding.
 - Negative vectors: every structural mutation in `docs/examples/v1-negative.py` is rejected
   with the documented ORKI code, and no malformed payload escapes the reader as an unhandled
   error.
 - Golden examples: the implementation reproduces `v1-example-1.bin` and `v1-example-2.bin`
   byte for byte (T1), including the filtered and the boundary-crossing block of example 2.
 - Memory bound: peak working set at four workers with an 8 MiB dictionary is at most 200 MiB
-  and at most the calculated formula (T13). The measurement may tighten the constants; it
+  and at most the calculated formula (T13). T13 also reports the whole-process peak, which is
+  informational and carries no normative limit. The measurement may tighten the constants; it
   must never widen the normative budget.
 
 Readiness for ratification (owner review 2026-10-05) adds three gates beyond the sections

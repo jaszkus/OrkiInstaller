@@ -196,7 +196,7 @@ def main():
             raw_file=None,
             raw_len=len(app),
             expect="ORKI-1001",
-            note="large-window Brotli bitstream (window 25 > 24); rejected before decoding",
+            note="large-window Brotli bitstream (window 25, above BROTLI_MAX_LGWIN 22); rejected before decoding",
         )
     )
 
@@ -237,6 +237,42 @@ def main():
         )
     )
 
+    store = "lzma2-x86-nonpe.bin"
+    write(store, xz(app, ["--x86", f"--lzma2=dict={8 * MIB}"]))
+    vectors.append(
+        dict(
+            id="V9",
+            codec="lzma2",
+            codec_id=1,
+            filter="bcj-x86",
+            filter_id=1,
+            lzma2_dict_size=8 * MIB,
+            comp_file=store,
+            raw_file=app_name,
+            raw_len=len(app),
+            expect="ok",
+            note="bcj-x86 on non-PE bytes: a filter is a length-preserving bijection over arbitrary content",
+        )
+    )
+
+    store = "brotli-w23.bin"
+    write(store, brotli(app, ["-w", "23"]))
+    vectors.append(
+        dict(
+            id="V10",
+            codec="brotli",
+            codec_id=2,
+            filter="none",
+            filter_id=0,
+            lzma2_dict_size=0,
+            comp_file=store,
+            raw_file=None,
+            raw_len=len(app),
+            expect="ORKI-1001",
+            note="window bits 23, above BROTLI_MAX_LGWIN (22); rejected from the stream header",
+        )
+    )
+
     for vector in vectors:
         path = os.path.join(OUT, vector["comp_file"])
         vector["comp_len"] = os.path.getsize(path)
@@ -254,6 +290,7 @@ def main():
         "generated_by": "docs/examples/v1-vectors.py",
         "verified_by": "docs/examples/v1-vectors-check.py",
         "tools": tools,
+        "brotli_max_lgwin": 22,
         "vectors": vectors,
     }
     with open(os.path.join(HERE, "v1-vectors.json"), "w", newline="\n") as fh:

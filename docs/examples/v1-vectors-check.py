@@ -10,23 +10,28 @@ VECTORS = os.path.join(HERE, "vectors")
 LZMA2_MAX_DICT = 32 << 20
 
 
-def tool(name):
-    path = shutil.which(name)
-    if not path:
-        sys.exit(f"v1-vectors-check: {name} is required")
-    return path
-
-
-XZ = tool("xz")
-BROTLI = tool("brotli")
-BLAKE3 = tool("b3sum") if shutil.which("b3sum") else os.environ.get("BLAKE3_BIN")
-if not BLAKE3 or not shutil.which(BLAKE3):
-    sys.exit("v1-vectors-check: need b3sum (or BLAKE3_BIN) for digests")
+XZ = shutil.which("xz")
+BROTLI = shutil.which("brotli")
+BLAKE3 = os.environ.get("BLAKE3_BIN") or shutil.which("b3sum")
+try:
+    import blake3 as blake3_module
+except ImportError:
+    blake3_module = None
+try:
+    import brotli as brotli_module
+except ImportError:
+    brotli_module = None
+if blake3_module is None and BLAKE3 is None:
+    sys.exit("v1-vectors-check: need the blake3 Python module, b3sum, or BLAKE3_BIN")
+if brotli_module is None and BROTLI is None:
+    sys.exit("v1-vectors-check: need the brotli Python module or the brotli CLI")
 
 FAILURES = []
 
 
 def blake3(data):
+    if blake3_module is not None:
+        return blake3_module.blake3(data).hexdigest()
     path = os.path.join(HERE, ".vector.tmp")
     with open(path, "wb") as fh:
         fh.write(data)
@@ -76,6 +81,21 @@ def decode_lzma2(blob, dict_size):
 
 
 def decode_lzma2_x86(blob, dict_size):
+    try:
+        return (
+            lzma.decompress(
+                blob,
+                format=lzma.FORMAT_RAW,
+                filters=[
+                    {"id": lzma.FILTER_X86},
+                    {"id": lzma.FILTER_LZMA2, "dict_size": dict_size},
+                ],
+            ),
+            None,
+        )
+    except (lzma.LZMAError, ValueError) as error:
+        if XZ is None:
+            return None, str(error)
     out = subprocess.run(
         [XZ, "-d", "--format=raw", "--x86", f"--lzma2=dict={dict_size}", "-c", "-"],
         input=blob,
@@ -85,6 +105,11 @@ def decode_lzma2_x86(blob, dict_size):
 
 
 def decode_brotli(blob):
+    if brotli_module is not None:
+        try:
+            return brotli_module.decompress(blob), None
+        except Exception as error:
+            return None, str(error)
     out = subprocess.run([BROTLI, "-d", "-c", "-"], input=blob, capture_output=True)
     return (out.stdout, None) if out.returncode == 0 else (None, out.stderr.decode().strip())
 
@@ -92,7 +117,8 @@ def decode_brotli(blob):
 def main():
     with open(os.path.join(HERE, "v1-vectors.json"), "r", encoding="utf-8") as fh:
         document = json.load(fh)
-    print(f"tools: {document['tools']}")
+    limit = document.get("brotli_max_lgwin", 22)
+    print(f"tools: {document['tools']} brotli_max_lgwin={limit}")
     for vector in document["vectors"]:
         blob = open(os.path.join(VECTORS, vector["comp_file"]), "rb").read()
         print(f"{vector['id']}: {vector['comp_file']} ({vector['note']})")
@@ -117,10 +143,11 @@ def main():
                 )
         if vector["codec"] == "brotli":
             wbits, large = brotli_window_bits(blob)
-            expect(
-                large or (wbits is not None and wbits <= 24),
-                f"{vector['id']} brotli window bits within 24 or large-window marker",
-            )
+            if vector["expect"] == "ok":
+                expect(
+                    not large and wbits is not None and wbits <= limit,
+                    f"{vector['id']} brotli window bits within {limit}",
+                )
 
         declared = vector["raw_len"]
         if vector["codec"] == "lzma2" and vector["filter_id"] == 0:
@@ -161,8 +188,10 @@ def main():
                 reason = f"dictionary {vector['lzma2_dict_size']} exceeds LZMA2_MAX_DICT"
             if vector["codec"] == "brotli":
                 wbits, large = brotli_window_bits(blob)
-                if large or (wbits or 0) > 24:
+                if large:
                     reason = "large-window brotli bitstream"
+                elif (wbits or 0) > limit:
+                    reason = f"window bits {wbits} above BROTLI_MAX_LGWIN ({limit})"
             expect(reason is not None, f"{vector['id']} rejected: {reason}")
 
     print(f"vectors={len(document['vectors'])} failures={len(FAILURES)}")
