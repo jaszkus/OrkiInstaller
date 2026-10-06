@@ -6,7 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Provisional (pre-ratification)
+
+Everything merged for the M1 format work is provisional. The 2026-10-05 ratification was
+withdrawn and `docs/format.md` rc2 is awaiting owner sign-off, so the payload format v1,
+Ed25519 signing, and the stub signature gate entries below (PRs #9-#12) are
+pre-ratification and subject to realignment in the follow-up implementation PRs. No `v*`
+tags are created from this state; specification tags use the `spec-` prefix so the release
+workflow stays untouched. The former "decisions D1-D5" entry is superseded by rc2: the
+exit code for ORKI-1002 is 1625, the dev-build gate is a Cargo feature (`dev-unsigned`,
+default off), and the data model moves to solid blocks with CDC chunks inside them.
+
+### Changed
+
+- `docs/format.md` revised to rc2 for owner ratification (implementation paused): full-payload byte coverage in the signed region, decision authority moved from the signed flag to the stub key table (`.orkikey` PE section), compressed-block hashes verified before decompression, domain-separated Ed25519 over a BLAKE3 digest, mutually derived hard limits and explicit pre-authentication allocation caps, string table in v1.0, flat file-to-block references with 4-8 MiB solid blocks as compression units (FastCDC chunks kept as the delta hashing unit), exit code for signature failures changed to 1625 with ORKI-1003 for unsupported versions, file metadata and component targeting in the manifest, uninstaller embedded as a hashed payload section, threat model, and extended acceptance criteria (coverage, downgrade, key-table patching, real Authenticode test certificate, cross-domain replay).
+
 ### Added
+
+- Compression measurement on a 515 MiB real-world Electron-style payload comparing independent 64/256 KiB chunks against 8 MiB solid blocks (with and without the BCJ x86 pre-filter available in lzma-rust2 0.21), recorded in `docs/reports/m1-compression.md` to decide the v1.0 block model before ratification. Ed25519 verification costs +65.5 KiB on the canonical `release` profile with a trusted key present (`docs/reports/m1-stub-size.md`); the earlier +123 KiB figure from a `codegen-units = 16` build is withdrawn as not reproducible, and a key-free build hides the cost because the linker drops the unreachable verification path.
 
 - Ed25519 payload signing in `orki-pack` (128-byte `ORKISIG` block at the end of the v1 payload): deterministic signing over the first 56 header bytes plus the manifest, `verify_payload_signature` with key-slot lookup and fail-closed errors (`UnsignedPayload`, `UnknownKeySlot`, `SignatureMismatch`, `BadMagic`), and `append_signature` that flips `FLAG_SIGNED`, extends `payload_len`, refreshes the header CRC, and refuses double signing.
 - `orki` CLI: `keygen` (Ed25519 seed/pubkey pair to a text file via `getrandom`) and `sign` (in-place signing followed by a self-check against the signer's own pubkey).
