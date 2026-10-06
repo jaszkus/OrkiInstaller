@@ -38,7 +38,12 @@ format version bump.
    decompression bombs are rejected before any allocation or disk write.
 
 Non-goals for v1.0: encryption (flag reserved, C6), deep Merkle trees (single-level hash
-list, revisited with delta updates), deduplication inside the installer payload (B2).
+list, revisited with delta updates), deduplication inside the installer payload (B2), and
+per-chunk (CDC) records. The manifest carries no chunk table (D13): integrity inside a block
+is block-level (`comp_blake3` before decompression, `raw_blake3` after it), and delta
+readiness lives in the chunk-addressed artifact of phase 3, not in the installer payload.
+"Normative content vs packer policy" below separates what a reader enforces from what the
+packer chooses.
 
 ## Normative content vs packer policy
 
@@ -239,8 +244,28 @@ Block {
 
 A block is the compression unit (target 4-8 MiB raw; codec parameters outside the block,
 C4). FastCDC chunks inside a block are the raw-byte hashing unit for the phase-3 delta
-artifact and diagnostics; v1.0 manifests do not carry per-chunk records. CRC32 per chunk
-is dropped (B8): BLAKE3 covers integrity.
+artifact and diagnostics; v1.0 manifests carry no per-chunk records and no chunk table
+(D13), so a reader never derives integrity from chunk boundaries and cannot be asked to
+re-chunk a payload. CRC32 per chunk is dropped (B8): BLAKE3 covers integrity.
+
+Hash and filter semantics (normative, and the reason the two hashes are not redundant):
+
+- `comp_blake3` covers the stored bytes of the block and is verified before any
+decompression (A3).
+- `raw_len` is the length of the block's raw byte range, and `raw_blake3` covers that range
+(i.e. the bytes the file records address). For `filter = 0` the codec output *is* the raw
+range, so a reader can verify `raw_blake3` immediately after decompression; for
+`filter != 0` the codec output is the filtered stream and the raw range only exists after
+the inverse filter, so a reader decompresses, applies the inverse filter, and then verifies
+`raw_blake3`. Every allowlisted filter is length-preserving, so the decompressed length, the
+inverse-filtered length, and `raw_len` are all equal.
+- A filter is applied per block to that block's own raw bytes, with the filter position base
+at 0; blocks decode independently, so a file may cross a block boundary and the blocks it
+occupies are filtered or not filtered independently of each other.
+- A block with `filter != 0` must be covered exclusively by file records that carry a
+`pe_version` (the packer sets it only for PE inputs), and its inverse-filtered output must
+start with `MZ`. Anything else is ORKI-1001 (D15). This is the enforceable form of
+"applied only to PE input": a block that mixes PE and non-PE content must not be filtered.
 
 Asset kinds (C3): 0 theme, 1 font, 2 icon, 3 license, 4 i18n, 5 shader, 6 image,
 7 script, 8 plugin, 9 uninstaller (only valid in the uninstaller section; rejected
@@ -255,10 +280,12 @@ block from the manifest alone.
 Filter allowlist (C4): v1.0 has exactly two pre-filters, `bcj-x86` (id 1) and `bcj-arm64`
 (id 2), both length-preserving and applied only to PE input, selected by the PE `Machine`
 field (0x8664 -> bcj-x86, 0xAA64 -> bcj-arm64). Filter id 0 means no pre-filter. A filter id
-outside the allowlist, a filter applied to a non-PE file, or a filtered stream whose output
-length differs from the block's `raw_len` is ORKI-1001. The remaining `lzma-rust2` filters
-(ARM, ARM-Thumb, PPC, SPARC, IA64, RISC-V, BCJ2, delta) are deliberately not part of the
-format: each is attack surface with no payload benefit here.
+outside the allowlist, a filter applied to a block that is not covered exclusively by PE
+file records, a filtered block whose inverse-filtered output does not start with `MZ`, or a
+filtered stream whose output length differs from the block's `raw_len` is ORKI-1001 (D15).
+The filter position base is 0 for every block (see "Hash and filter semantics"). The
+remaining `lzma-rust2` filters (ARM, ARM-Thumb, PPC, SPARC, IA64, RISC-V, BCJ2, delta) are
+deliberately not part of the format: each is attack surface with no payload benefit here.
 
 ### Validation pipeline (in order, fail closed)
 
@@ -397,7 +424,7 @@ it as part of step 3.)
 | max total raw size | 8 GiB | 200_000 blocks x 40 KiB average bound (B6) |
 | max manifest_len | 64 MiB | ~35 MB at 100k files + 800k refs by estimate; 64 MiB is headroom |
 | max string table | 64 MiB | shares the manifest bound |
-| LZMA2 dict | LZMA2_MAX_DICT = 32 MiB | reader limit derived from the 200 MiB extraction budget (32 MiB x 4 workers + buffers stays inside it); packer default dict = block size rounded up to a supported value |
+| LZMA2 dict | LZMA2_MAX_DICT = 32 MiB | reader limit derived from the 200 MiB extraction budget: the worst legal combination (32 MiB dictionary with a 16 MiB block) costs 64.2 MiB per worker, so two workers plus the fixed overhead stay inside the budget and the derived worker count is 3 (see "Decoder memory budget"); packer default dict = block size rounded up to a supported value |
 | Brotli window | lgwin <= 24 | large windows disabled |
 | block slack | comp_len <= raw_len + 1 KiB | incompressible input stored, not expanded |
 | decompression output | raw_len + 1 | bomb rejection |
@@ -406,24 +433,48 @@ it as part of step 3.)
 Block `comp_len` sums must not exceed the blocks region length; the partition check (A1)
 enforces it structurally.
 
-### Decoder memory budget (P0-3)
+### Decoder memory budget (P0-3, D8)
 
-Extraction is a streaming pipeline with a hard process-wide budget of 200 MiB, independent
-of payload size. Per-worker cost is dominated by the codec window, so parallelism is derived
-from the payload and never fixed:
+Extraction is a streaming pipeline with a hard process-wide budget of 200 MiB, independent of
+payload size. The budget is enforced **by construction from the format's own limits**, not
+from a measurement on one machine: every per-worker buffer is either a constant or bounded by
+`raw_len`, and `raw_len` is bounded by the maximum raw block size.
 
 ```text
-per_worker = dict_size + filter_buffers + 64 KiB range-decoder buffer   (LZMA2)
-workers    = max(1, min(logical_cores, floor((budget - fixed_overhead) / per_worker)))
+dict        = (dict_size + 15) & ~15                   LZMA2 dictionary window
+codec_state = 64 KiB range-decoder buffer + 40 KiB     lzma-rust2 get_memory_usage()
+filter      = 4 KiB                                    bcj filter buffer, when filter != 0
+comp_buffer = max_raw_block + COMPRESSION_SLACK        stored bytes of one block
+out_buffer  = max_raw_block + 1                        decompression cap (bomb rejection)
+thread      = 64 KiB stack + bookkeeping
+
+per_worker  = dict + codec_state + filter + comp_buffer + out_buffer + thread
+workers     = max(1, min(logical_cores, floor((budget - fixed_overhead) / per_worker)))
 ```
 
-The packer's default dictionary equals the block size rounded up to the next supported value
-(a dictionary larger than the block it decodes buys nothing) and never exceeds
-`LZMA2_MAX_DICT`. With 8 MiB blocks and a 200 MiB budget this is nowhere near the worker
-limit, so the parallel path is not memory-bound; a payload that forces `workers = 1` still
-decodes correctly, it only loses parallelism. The block-size study in
-`docs/reports/m1-compression.md` fixes the final default and confirms the budget on real
-payloads.
+With the default policy (`dict_size` = 8 MiB, `max_raw_block` = 8 MiB) the arithmetic is
+8 + 8 + 8 MiB + 172 KiB = 24.2 MiB per worker, so the 200 MiB budget supports eight workers
+and the core count alone decides the parallelism. At the worst combination the format allows
+(32 MiB dictionary with a 16 MiB block) it is 64.2 MiB per worker and the derived worker count
+is 3, i.e. 192.6 MiB - inside the budget with no special-casing. A payload that forces
+`workers = 1` still decodes correctly and only loses parallelism; a reader that cannot fit
+even one worker refuses the payload instead of exceeding the budget. A streaming reader may
+hold less than `comp_buffer` + `out_buffer` (it can hash the compressed bytes while feeding
+the decoder, and write the output as it is produced), which is why those two terms are the
+conservative assumption rather than an optimization target.
+
+The probability tables of the range decoder and the literal coder do not break this bound:
+lzma-rust2 keeps them inside its fixed 40 KiB term (next to the 64 KiB compressed-byte
+buffer), and its LZMA2 property decoding rejects any stream with `lc + lp > 4` or
+`props > (4 * 5 + 4) * 9 + 8` (`lzma2_reader.rs::decode_lzma2_props`, `get_memory_usage`;
+`filter/bcj.rs::FILTER_BUF_SIZE = 4096`), so no payload can enlarge them.
+
+The constants above come from this arithmetic, not from a measurement (D8). A measurement of
+peak working set has exactly one job: verifying that the formula really is an upper bound
+(T13: peak RSS with four workers and an 8 MiB dictionary <= 200 MiB **and** <= the formula).
+Measured values below the bound may tighten the constants in a later revision; they can never
+widen the normative budget. The block-size study in `docs/reports/m1-compression.md` fixes the
+default block size this arithmetic assumes.
 
 ### Manifest budget (A5)
 
@@ -479,11 +530,14 @@ which includes the whole plan, every path, and every block digest.
 | D5 | LZMA2_MAX_DICT = 32 MiB as a reader limit; packer dictionary = block size | 2026-10-06 | accepted |
 | D6 | format filter allowlist: bcj-x86 and bcj-arm64 only, PE-only, length-preserving | 2026-10-06 | accepted |
 | D7 | packer policy: bcj-x86 on by default for PE x64, ARM64 off until corpus 2 | 2026-10-06 | provisional, pending corpus 2 |
-| D8 | extraction memory budget 200 MiB, worker count derived from it | 2026-10-06 | accepted; constants from the RSS measurement in `docs/reports/m1-compression.md` |
+| D8 | extraction memory budget 200 MiB, worker count derived from it | 2026-10-06 | accepted; constants derive from the buffer arithmetic in "Decoder memory budget", verified (not defined) by the T13 measurement |
 | D9 | key table without validity windows; rotation by stub rebuild; revocation on the update channel | 2026-10-06 | accepted |
-| D10 | stub size budgets: full release 6.94 MiB, full ci 7.97 MiB; lite and headless measured separately | 2026-10-06 | accepted |
+| D10 | stub size budgets: full release 6.94 MiB, full ci 7.97 MiB; lite and headless measured separately | 2026-10-06 | accepted; extended by D14 |
 | D11 | compression numbers stay out of the normative text; reports carry them | 2026-10-06 | accepted |
 | D12 | the payload fingerprint is the verified `sig_digest`, not a stored manifest field (circular dependency found by the worked example) | 2026-10-06 | accepted |
+| D13 | v1.0 carries no per-chunk (CDC) records: no chunk table in the manifest, block-level `comp_blake3`/`raw_blake3` as the integrity unit inside a block, delta readiness moved to the chunk-addressed phase-3 artifact | 2026-10-06 | accepted |
+| D14 | stub size budgets: full release 6.94 MiB, full ci 7.97 MiB; lite and headless from their own measurement plus 15%; alarm when a variant grows more than 5% against `main`; the size gate builds with a trusted key present, and `xtask/budgets.toml` is updated in the implementation PRs | 2026-10-06 | accepted |
+| D15 | a block with `filter != 0` must be covered exclusively by PE file records and must inverse-filter to a stream starting with `MZ`; the filter position base is 0 per block | 2026-10-06 | proposed (surfaced by example 2, needs owner confirmation) |
 
 ## Traceability matrix
 
@@ -503,6 +557,9 @@ Test IDs (the full criteria follow under "Acceptance criteria for the v1 impleme
 | T10 | determinism: identical payload bytes on Windows and Linux with threaded compression |
 | T11 | cross-domain replay: payload signatures and remote-manifest signatures do not interchange |
 | T12 | nightly fuzz targets: header, string table, manifest, block decoding, PE locator |
+| T13 | decoder memory bound: peak working set at four workers with an 8 MiB dictionary is <= 200 MiB and <= the calculated formula |
+| T14 | decoder vectors V1-V8 (`docs/examples/vectors/`) decode to the declared length and `raw_blake3` with external tooling |
+| T15 | negative vectors: every mutation in `docs/examples/v1-negative.py` is rejected with the documented ORKI code |
 
 | requirement | section | tests |
 |---|---|---|
@@ -516,14 +573,14 @@ Test IDs (the full criteria follow under "Acceptance criteria for the v1 impleme
 | B2 flat file-to-block references | Manifest | T5 |
 | B3 string table in v1.0 | String table | T5 |
 | B4 single version counter | Manifest | T5 |
-| B5 error catalog | Exit codes and error catalog | T5 |
+| B5 error catalog | Exit codes and error catalog | T5, T15 |
 | B6 mutually derived limits | Hard limits, Manifest budget | T5, T6 |
 | B7 section order | Container layout, Packaging order | T8 |
 | B8 no per-chunk CRC32; canonical reserved bytes | Manifest, Payload header | T5 |
 | C1 file metadata | Manifest (FileEntry) | T2 |
 | C2 component/target/arch_mask | Manifest (FileEntry) | T5 |
 | C3 asset kinds | Asset kinds | T5 |
-| C4 codec parameters and filter allowlist | Codec parameters, Block metadata | T5, T6 |
+| C4 codec parameters and filter allowlist | Codec parameters, Block metadata | T5, T6, T14 |
 | C5 payload fingerprint | Payload fingerprint | T11 |
 | C6 encryption reservation | Encryption | T3 |
 | C7 unsigned diagnostic policy | Signed-flag downgrade and unsigned diagnostic policy | T3 |
@@ -531,7 +588,7 @@ Test IDs (the full criteria follow under "Acceptance criteria for the v1 impleme
 | Q1 exit codes for the three Orki errors | Exit codes and error catalog | T5 |
 | Q2 dev builds and release CI assertions | Unsigned dev builds and release CI, `.orkikey` | T3, T4 |
 | Q3 Ed25519 conditions and key custody | Ed25519, CLI surface, Key table | T9 |
-| Q4 block/chunk model and decoder budget | Block metadata, Decoder memory budget | T6 |
+| Q4 block/chunk model and decoder budget | Block metadata, Decoder memory budget | T6, T13, T14 |
 | Q5 uninstaller wire shape | Uninstaller | T5 |
 
 ## Threat model
@@ -563,46 +620,174 @@ removed from the writer in PR #11; no migration path is provided.
 
 ## Worked example (byte map)
 
-A minimal payload produced strictly from the rules above: two files (`a.txt` = `hello`,
-`b.bin` = `world!`), one block with codec `store`, one signature block. It is generated by
-an independent script written from this document alone and re-read by a second script that
-checks the invariants below; both live in the measurement artifact directory. The golden
-files (T1) must match it.
+The reference material for independent implementations lives in `docs/examples/` (see
+`docs/examples/README.md`). It is not product code: the scripts exist so that a second
+implementation can be written from this document alone and compared byte for byte, and the
+golden files (T1) must reproduce it exactly.
+
+### Example 1: minimal payload (byte map)
+
+Two files (`a.txt` = `hello`, `b.bin` = `world!`), one block with codec `store`, one
+signature block, empty config, asset, and uninstaller regions. `v1-example-1.bin`, 454 bytes:
 
 | region | offset | size |
 |---|---|---|
 | header | 0 | 64 |
 | string table (`ORKISTR\0`, count 3, blob 10 B: `""`, `a.txt`, `b.bin`) | 64 | 38 |
-| manifest (postcard) | 102 | 211 |
-| config | 313 | 0 |
-| assets | 313 | 0 |
-| uninstaller | 313 | 0 |
-| blocks (one block, codec `store`, raw 11 B) | 313 | 11 |
-| signature block | 324 | 128 |
-| `payload_len` | | 452 |
+| manifest (postcard) | 102 | 213 |
+| config | 315 | 0 |
+| assets | 315 | 0 |
+| uninstaller | 315 | 0 |
+| blocks (one block, codec `store`, raw 11 B) | 315 | 11 |
+| signature block | 326 | 128 |
+| `payload_len` | | 454 |
 
 Header values: `format_version` 1, `header_size` 64, `file_count` 2, `block_count` 1,
-`flags` 1 (signature present), `manifest_offset` 102, `manifest_len` 211, `blocks_offset`
-313, `header_crc32` `0xa7463d48`, reserved 0. Because `store` is used, `raw_blake3` and
-`comp_blake3` of the block are equal: `9bc016b22c6e916e738e5d16dbd373bbb4185776b7c8c6742dcaf5f5628c922c`.
-The covered region is `[56, 324)` and its digest is
-`e3fd0ee3c233ecef0ad7e09ae6f9bd908d922337be56e160688b95b82191e9c5`, which is also the payload
-fingerprint (C5). The signature message is
-`DOMAIN_TAG_ORKI_PAYLOAD_V1 || header[0..56] || sig_digest`; the 64 signature bytes depend on
-the test key and are pinned by the golden file. The example file's SHA-256 is
-`d1ee774163268341b16734de7fa0a1fa59d8129dfa59d1c2b120cc45be5c2b29`.
+`flags` 1 (signature present), `manifest_offset` 102, `manifest_len` 213, `blocks_offset`
+315, `header_crc32` `0x330a711e`, reserved 0. Because `store` is used, `raw_blake3` and
+`comp_blake3` of the block are equal:
+`9bc016b22c6e916e738e5d16dbd373bbb4185776b7c8c6742dcaf5f5628c922c`. The covered region is
+`[56, 326)`, its digest — and therefore the payload fingerprint (C5) — is
+`bbf60e4a35fb491e7be719f7db70cb28c13e5e3060fcd2d375a87dad684404a8`, and the file's SHA-256 is
+`01b810338574d3427746520c90806b6dd982c2fc27a99efe7bb76c746a4816f2`. The signature message is
+`DOMAIN_TAG_ORKI_PAYLOAD_V1 || header[0..56] || sig_digest`. The 128 signature bytes in the
+committed file are zero-filled — their content depends on the test key and is pinned by the
+signed golden file (T1), not by this example.
 
-Invariants the reader script checks (all pass): magic, version, `header_size` and reserved
-bytes, header CRC32 over `0..56`, the string table ending exactly at `manifest_offset`,
-sections covering `[64, payload_len - 128)` with no gaps or overlaps, manifest counts
-matching the header, every block reference staying inside its block, per-file raw accounting
-equal to `size`, file sizes summing to the block's raw length, and the manifest consumed
-byte-exactly.
+Note that `config_offset` and `uninstaller_offset` are payload-relative offsets (315), not
+zero: an earlier revision of this example wrote `0` and produced a manifest two bytes
+shorter, which the section-coverage rule rejects. The values here are the ones a reader
+accepts.
 
-Writing this example changed the format twice: the manifest had no `blocks` field to carry
-the `Block` records that `block_count` announces (added), and `payload_fingerprint` was
+### Example 2: structural payload (byte map)
+
+Exercises the paths where the risk sits: a non-empty config with its hash inside the signed
+region, two asset records (`icon`, `license`), an uninstaller, two blocks, a file crossing a
+block boundary, a `bcj-x86` filtered block, non-zero component and target string indices, and
+manifest offsets whose two-byte varints make the layout a fixed point rather than a one-pass
+estimate. Block size 256 is artificial, chosen to force a multi-block layout at a small file
+size. `v1-example-2.bin`, 1252 bytes:
+
+| region | offset | size |
+|---|---|---|
+| header | 0 | 64 |
+| string table (`ORKISTR\0`, count 5, blob 32 B: `""`, `app`, `app/a.bin`, `app/data/app.exe`, `core`) | 64 | 68 |
+| manifest | 132 | 374 |
+| config (`{"install":{"scope":"user","shortcuts":["demo2"]}}`) | 506 | 50 |
+| assets (`icon-bytes`, `license text`) | 556 | 22 |
+| uninstaller (34 B, `MZ` + 32 bytes) | 578 | 34 |
+| blocks | 612 | 512 |
+| signature block | 1124 | 128 |
+| `payload_len` | | 1252 |
+
+Header values: `format_version` 1, `file_count` 2, `block_count` 2, `flags` 1,
+`manifest_offset` 132, `manifest_len` 374, `blocks_offset` 612, `header_crc32` `0x03d849c9`,
+reserved 0. The covered region is `[56, 1124)`, `sig_digest` (payload fingerprint) is
+`31d72217d028a1edbed1e63a9c9ad16f08088c76fa400d988de54d4e4d0738a3`, and the file's SHA-256 is
+`b90f795d8f1981c8b33456f34288c828f95f0d363bfe38fa4fcd5f928156f124`. Config hash, asset
+hashes, and uninstaller hash are in the file's manifest and checked by the reader script.
+
+Files: `app/data/app.exe` (340 B, `pe_version` 1.2.3.0, component index of `core`, target
+index of `app`, raw range `[0, 340)`) and `app/a.bin` (172 B, component and target index 0,
+raw range `[340, 512)`). The PE-like file therefore crosses the block boundary at 256.
+
+| block | codec | filter | raw_len | comp_len | comp_blake3 | raw_blake3 |
+|---|---|---|---|---|---|---|
+| 0 | store | bcj-x86 | 256 | 256 | `d40c5d2844d54faaa304ac031dfb166dc0f2f6efc137974cdd1b39cadd3d2106` | `d10ae3425b9de06e1088dbf4116c9a042641e8cbf84519a179d52e722129f959` |
+| 1 | store | none | 256 | 256 | `9f31569691a3b2bc6985f116355712c952236d46752cfbcdf3c85ccfd6dff2cc` | `9f31569691a3b2bc6985f116355712c952236d46752cfbcdf3c85ccfd6dff2cc` |
+
+Block 0 is covered exclusively by the PE file record, so it carries the `bcj-x86` pre-filter;
+block 1 mixes the PE tail with `app/a.bin`, so it must not be filtered (D15). The two hashes
+differ exactly where the filter acted: `comp_blake3` covers the filtered bytes the codec sees,
+`raw_blake3` covers the unfiltered bytes the file records address. Regenerate with
+`python v1-example.py` and re-validate with `python v1-example-check.py`.
+
+### Decoder vectors
+
+`docs/examples/vectors/` holds eight block payloads with metadata in
+`docs/examples/v1-vectors.json`; `docs/examples/v1-vectors-check.py` decodes every positive
+vector with independent tooling (xz 5.8.3, brotli 1.2.0, and Python's liblzma binding) and
+asserts the declared length, `raw_blake3`, and the stream's own parameters. The format defines
+decoding, not encoding: these streams come from external encoders and are deliberately not
+pinned to a library version, whereas a packer's own compressed bytes are a regression test
+that is re-recorded consciously when a codec version changes.
+
+| id | codec | filter | dictionary or window | declared raw_len | expectation |
+|---|---|---|---|---|---|
+| V1 | lzma2 | none | dictionary 8 MiB | 32768 | decodes, `raw_blake3` matches |
+| V2 | lzma2 | bcj-x86 | dictionary 8 MiB | 16384 | decodes, `raw_blake3` matches |
+| V3 | brotli | none | window bits 22 | 32768 | decodes |
+| V4 | lzma2 | none | dictionary 32 MiB (`LZMA2_MAX_DICT`) | 32768 | decodes |
+| V5 | lzma2 | none | dictionary 1 MiB | 4096 | ORKI-1001: first chunk declares 1048575 bytes |
+| V6 | brotli | none | large window 25 | 32768 | ORKI-1001: window above 24 |
+| V7 | lzma2 | none | dictionary 64 MiB | 32768 | ORKI-1001: dictionary above `LZMA2_MAX_DICT` |
+| V8 | brotli | none | window bits 16 | 32768 | decodes |
+
+Two consequences of these vectors are normative:
+
+- An LZMA2 stream bounds its own output: the first chunk header declares the uncompressed
+  size it will produce, so a reader can reject a decompression bomb as ORKI-1001 from the
+  header alone, before allocating anything (V5). The `raw_len + 1` output cap remains the
+  second line of defence for streams whose chunks are each small enough but whose total is
+  not.
+- A large-window Brotli bitstream is **not** rejected by the decoder libraries this project
+  links: brotli 1.2.0 accepts `--large_window=25`, and the Rust `brotli` crate used by
+  `orki-pack` decodes the same stream (`brotli::Decompressor` returns the full output). A
+  v1.0 reader must therefore validate the window bits of a Brotli block **before** handing it
+  to the decoder, by reading the stream's `WBITS` prefix: `1` -> 16 bits; `0` then a non-zero
+  3-bit `n` -> `17 + n`; `0 000` then `000` -> 17; `0 000` then `001` -> the incompatible
+  large-window bitstream. Any value above 24 is ORKI-1001 (V6); the decoder alone cannot be
+  trusted to enforce `lgwin <= 24`.
+
+### Negative vectors
+
+`docs/examples/v1-negative.py` mutates example 2 one field at a time and runs the independent
+reader over the result; each mutation must be rejected with the documented code (29
+mutations, all reproduced). The last three rows are signature-level and are covered by T3/T11
+in the implementation PRs rather than by a structural reader.
+
+| mutation | expected |
+|---|---|
+| `format_version` 1 -> 2 | ORKI-1003 |
+| header CRC32 field changed | ORKI-1001 |
+| reserved header word non-zero | ORKI-1001 |
+| `flags` bit 1 (encryption) set | ORKI-1001 |
+| `payload_len` off by one | ORKI-1001 |
+| `file_count` 100001 or `block_count` 200001 | ORKI-1001 |
+| `manifest_len` shortened (gap) or extended (overlap) | ORKI-1001 |
+| `blocks_offset` moved by one (gap) | ORKI-1001 |
+| string table magic broken | ORKI-1001 |
+| manifest `schema` 1 -> 2 | ORKI-1001 |
+| `config_offset` shifted (section gap) | ORKI-1001 |
+| config, asset, or uninstaller hash byte flipped | ORKI-1001 |
+| config, asset, or uninstaller byte flipped | ORKI-1001 |
+| asset kind 11 | ORKI-1001 |
+| file `size` raised by one | ORKI-1001 |
+| block reference length past the end of its block | ORKI-1001 |
+| block codec 3 (reserved zstd) | ORKI-1001 |
+| block filter 3 (outside the allowlist) | ORKI-1001 |
+| `comp_len` beyond `raw_len + 1 KiB` | ORKI-1001 |
+| stored block byte flipped | ORKI-1001 |
+| signature block zeroed on a keyed stub | ORKI-1002 |
+| signature domain tag replaced | ORKI-1002 |
+| signed flag cleared on a keyed stub | ORKI-1002 |
+
+Invariants the reader script checks for both examples (all pass): magic, version,
+`header_size` and reserved bytes, header CRC32 over `0..56`, the flag bits, the hard limits,
+the string table ending exactly at `manifest_offset`, sections covering
+`[64, payload_len - 128)` with no gaps or overlaps, manifest counts matching the header,
+every block reference staying inside its block, per-file raw accounting equal to `size`, file
+sizes summing to the block's raw length, every block covered by file records, block slack,
+the filter length rule, and the manifest consumed byte-exactly. A malformed payload never
+propagates an exception out of the reader: structural faults become ORKI-1001.
+
+Writing these examples changed the format four times. The manifest had no `blocks` field to
+carry the `Block` records that `block_count` announces (added). `payload_fingerprint` was
 defined as a hash of the digest inside the region that digest covers (circular; the field is
-removed and C5 now defines the fingerprint as the verified digest itself).
+removed and C5 now defines the fingerprint as the verified digest itself). The filter record
+forced D15, because "applied only to PE input" was unenforceable while a block could mix PE
+and non-PE content. And the two block hashes needed a stated subject: `comp_blake3` covers
+the stored (filtered) bytes, `raw_blake3` covers the raw byte range after the inverse filter.
 
 ## Acceptance criteria for the v1 implementation PRs
 
@@ -636,6 +821,23 @@ removed and C5 now defines the fingerprint as the verified digest itself).
   (`docs/reports/m1-stub-size.md`).
 - Cross-domain replay test: a signature produced for the remote-manifest context fails
   payload verification and vice versa.
+- Decoder vectors: the eight vectors in `docs/examples/v1-vectors.json` decode to their
+  declared length and `raw_blake3` with external tooling, and the two negative cases (V5
+  output cap, V6 large window) are rejected before allocation or decoding.
+- Negative vectors: every structural mutation in `docs/examples/v1-negative.py` is rejected
+  with the documented ORKI code, and no malformed payload escapes the reader as an unhandled
+  error.
+- Golden examples: the implementation reproduces `v1-example-1.bin` and `v1-example-2.bin`
+  byte for byte (T1), including the filtered and the boundary-crossing block of example 2.
+- Memory bound: peak working set at four workers with an 8 MiB dictionary is at most 200 MiB
+  and at most the calculated formula (T13). The measurement may tighten the constants; it
+  must never widen the normative budget.
+
+Readiness for ratification (owner review 2026-10-05) adds three gates beyond the sections
+themselves: the CDC question is resolved rather than deferred (D13), the decoder memory budget
+is derived from buffer arithmetic instead of from one desktop measurement (D8), and both the
+decoder vectors and the negative-vector table are present and reproducible from external
+tooling. All three were open in the withdrawn draft and are closed in this revision.
 
 ## Compression study
 
