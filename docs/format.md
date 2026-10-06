@@ -40,6 +40,20 @@ format version bump.
 Non-goals for v1.0: encryption (flag reserved, C6), deep Merkle trees (single-level hash
 list, revisited with delta updates), deduplication inside the installer payload (B2).
 
+## Normative content vs packer policy
+
+This document defines only what a **reader** must enforce: field layouts and magics, the
+filter allowlist, the hard limits (LZMA2_MAX_DICT, maximum block size, the extraction memory
+budget, manifest and string-table bounds), the error catalog, and the validation order.
+Changing any of those requires an ADR and a format-version bump.
+
+Packer policy is deliberately **not** normative: the default block size, stream grouping and
+ordering, whether a filter is applied by default and to which architectures, the
+Brotli-versus-LZMA2 choice, the compression preset per profile, and the store-detection
+heuristic. Policy lives in `docs/reports/m1-compression.md` and can change without
+re-ratifying this document as long as every payload it produces satisfies the rules above; a
+reader never rejects a payload for having been produced with different policy values.
+
 ## Container layout
 
 ```
@@ -176,10 +190,10 @@ PackManifest v1 {
   schema: u32 = 1,
   app_id: str, app_name: str, app_version: str,
   signer_key_slot: u8,
-  payload_fingerprint: [u8; 32],            BLAKE3 of sig_digest (C5)
   config_offset: u64, config_len: u32, config_blake3: [u8; 32],
   uninstaller_offset: u64, uninstaller_len: u32, uninstaller_blake3: [u8; 32],
   assets: Vec<AssetEntry>,
+  blocks: Vec<Block>,
   files: Vec<FileEntry>,
 }
 FileEntry {
@@ -383,7 +397,7 @@ it as part of step 3.)
 | max total raw size | 8 GiB | 200_000 blocks x 40 KiB average bound (B6) |
 | max manifest_len | 64 MiB | ~35 MB at 100k files + 800k refs by estimate; 64 MiB is headroom |
 | max string table | 64 MiB | shares the manifest bound |
-| LZMA2 dict | LZMA2_MAX_DICT = 32 MiB | decoder-side cap; default dict = block size rounded up to a supported value; final value fixed by the block-size study |
+| LZMA2 dict | LZMA2_MAX_DICT = 32 MiB | reader limit derived from the 200 MiB extraction budget (32 MiB x 4 workers + buffers stays inside it); packer default dict = block size rounded up to a supported value |
 | Brotli window | lgwin <= 24 | large windows disabled |
 | block slack | comp_len <= raw_len + 1 KiB | incompressible input stored, not expanded |
 | decompression output | raw_len + 1 | bomb rejection |
@@ -446,8 +460,79 @@ signature flag), and v1.0 writers never set bit 1.
 
 ### Payload fingerprint (C5)
 
-`payload_fingerprint` = BLAKE3 of `sig_digest`, carried in the signed manifest. Receipts,
-repair, and the remote manifest (14a) reference an installed payload by this fingerprint.
+The payload fingerprint is the verified `sig_digest` itself (the 32-byte BLAKE3 digest over
+the covered region), not a stored field. Carrying a hash *of* the digest inside the region
+that digest covers would be circular: the digest would depend on a field that depends on the
+digest, and any placeholder scheme would have to zero bytes to break the loop. Tooling prints
+the fingerprint (`orki inspect`), and receipts, repair, and the remote manifest (14a)
+reference an installed payload by this value. It changes whenever any covered byte changes,
+which includes the whole plan, every path, and every block digest.
+
+## Decision log
+
+| # | decision | date | status |
+|---|---|---|---|
+| D1 | ORKI-1002 exits 1625; 1621/1622 stay MSI semantics; ORKI-1003 added for versions | 2026-10-05 | accepted |
+| D2 | unsigned dev payloads gated by the `dev-unsigned` Cargo feature, not debug assertions | 2026-10-05 | accepted |
+| D3 | ed25519-dalek 3.0.0 stays (canonical release cost +65.5 KiB, BSD-3-Clause, `verify_strict`); `ed25519-compact` dropped | 2026-10-06 | accepted |
+| D4 | two-level data model: block = compression unit, CDC chunk = raw-hashing unit | 2026-10-05 | accepted; margin re-checked on corpora 2 and 3 |
+| D5 | LZMA2_MAX_DICT = 32 MiB as a reader limit; packer dictionary = block size | 2026-10-06 | accepted |
+| D6 | format filter allowlist: bcj-x86 and bcj-arm64 only, PE-only, length-preserving | 2026-10-06 | accepted |
+| D7 | packer policy: bcj-x86 on by default for PE x64, ARM64 off until corpus 2 | 2026-10-06 | provisional, pending corpus 2 |
+| D8 | extraction memory budget 200 MiB, worker count derived from it | 2026-10-06 | accepted; constants from the RSS measurement in `docs/reports/m1-compression.md` |
+| D9 | key table without validity windows; rotation by stub rebuild; revocation on the update channel | 2026-10-06 | accepted |
+| D10 | stub size budgets: full release 6.94 MiB, full ci 7.97 MiB; lite and headless measured separately | 2026-10-06 | accepted |
+| D11 | compression numbers stay out of the normative text; reports carry them | 2026-10-06 | accepted |
+| D12 | the payload fingerprint is the verified `sig_digest`, not a stored manifest field (circular dependency found by the worked example) | 2026-10-06 | accepted |
+
+## Traceability matrix
+
+Test IDs (the full criteria follow under "Acceptance criteria for the v1 implementation PRs"):
+
+| id | test |
+|---|---|
+| T1 | golden files (unsigned, signed, signed with certificate table) read back byte-exact |
+| T2 | coverage: a single-byte flip anywhere in the payload is detected |
+| T3 | downgrade: a cleared signed flag does not open a release installation |
+| T4 | the stub reads a key-table value patched after compilation |
+| T5 | malformed inputs: oversized counts, overlapping ranges, reserved bytes, bad magics |
+| T6 | decompression bomb: cap `raw_len + 1`, `comp_blake3` checked before decompression |
+| T7 | PE locator fuzz plus edge cases (unsorted sections, zero raw pointers, short files) |
+| T8 | packaging order: editing resources after the payload is refused |
+| T9 | real Authenticode certificate in CI; re-sign and dual-sign cycles |
+| T10 | determinism: identical payload bytes on Windows and Linux with threaded compression |
+| T11 | cross-domain replay: payload signatures and remote-manifest signatures do not interchange |
+| T12 | nightly fuzz targets: header, string table, manifest, block decoding, PE locator |
+
+| requirement | section | tests |
+|---|---|---|
+| A1 full byte coverage | Signed region and coverage | T2, T5 |
+| A2 signed flag informational | Signed flag | T3 |
+| A3 verify before decompression | Validation pipeline (step 7), Block metadata | T6 |
+| A4 domain-separated signature | Signed region and coverage | T11 |
+| A5 allocation discipline | Validation pipeline (step 4), Manifest budget | T5 |
+| A6 key table in PE section | Key table, Packaging order | T4, T8 |
+| B1 8-byte magics | Container layout, Signature block, String table | T5, T12 |
+| B2 flat file-to-block references | Manifest | T5 |
+| B3 string table in v1.0 | String table | T5 |
+| B4 single version counter | Manifest | T5 |
+| B5 error catalog | Exit codes and error catalog | T5 |
+| B6 mutually derived limits | Hard limits, Manifest budget | T5, T6 |
+| B7 section order | Container layout, Packaging order | T8 |
+| B8 no per-chunk CRC32; canonical reserved bytes | Manifest, Payload header | T5 |
+| C1 file metadata | Manifest (FileEntry) | T2 |
+| C2 component/target/arch_mask | Manifest (FileEntry) | T5 |
+| C3 asset kinds | Asset kinds | T5 |
+| C4 codec parameters and filter allowlist | Codec parameters, Block metadata | T5, T6 |
+| C5 payload fingerprint | Payload fingerprint | T11 |
+| C6 encryption reservation | Encryption | T3 |
+| C7 unsigned diagnostic policy | Signed-flag downgrade and unsigned diagnostic policy | T3 |
+| C8 repair/modify payload source | Uninstaller | implementation PRs |
+| Q1 exit codes for the three Orki errors | Exit codes and error catalog | T5 |
+| Q2 dev builds and release CI assertions | Unsigned dev builds and release CI, `.orkikey` | T3, T4 |
+| Q3 Ed25519 conditions and key custody | Ed25519, CLI surface, Key table | T9 |
+| Q4 block/chunk model and decoder budget | Block metadata, Decoder memory budget | T6 |
+| Q5 uninstaller wire shape | Uninstaller | T5 |
 
 ## Threat model
 
@@ -475,6 +560,49 @@ table are designed to make a scheduled, non-emergency operation.
 
 The pre-M1 prototype format (64-byte footer, absolute offsets, CRC-only integrity) was
 removed from the writer in PR #11; no migration path is provided.
+
+## Worked example (byte map)
+
+A minimal payload produced strictly from the rules above: two files (`a.txt` = `hello`,
+`b.bin` = `world!`), one block with codec `store`, one signature block. It is generated by
+an independent script written from this document alone and re-read by a second script that
+checks the invariants below; both live in the measurement artifact directory. The golden
+files (T1) must match it.
+
+| region | offset | size |
+|---|---|---|
+| header | 0 | 64 |
+| string table (`ORKISTR\0`, count 3, blob 10 B: `""`, `a.txt`, `b.bin`) | 64 | 38 |
+| manifest (postcard) | 102 | 211 |
+| config | 313 | 0 |
+| assets | 313 | 0 |
+| uninstaller | 313 | 0 |
+| blocks (one block, codec `store`, raw 11 B) | 313 | 11 |
+| signature block | 324 | 128 |
+| `payload_len` | | 452 |
+
+Header values: `format_version` 1, `header_size` 64, `file_count` 2, `block_count` 1,
+`flags` 1 (signature present), `manifest_offset` 102, `manifest_len` 211, `blocks_offset`
+313, `header_crc32` `0xa7463d48`, reserved 0. Because `store` is used, `raw_blake3` and
+`comp_blake3` of the block are equal: `9bc016b22c6e916e738e5d16dbd373bbb4185776b7c8c6742dcaf5f5628c922c`.
+The covered region is `[56, 324)` and its digest is
+`e3fd0ee3c233ecef0ad7e09ae6f9bd908d922337be56e160688b95b82191e9c5`, which is also the payload
+fingerprint (C5). The signature message is
+`DOMAIN_TAG_ORKI_PAYLOAD_V1 || header[0..56] || sig_digest`; the 64 signature bytes depend on
+the test key and are pinned by the golden file. The example file's SHA-256 is
+`d1ee774163268341b16734de7fa0a1fa59d8129dfa59d1c2b120cc45be5c2b29`.
+
+Invariants the reader script checks (all pass): magic, version, `header_size` and reserved
+bytes, header CRC32 over `0..56`, the string table ending exactly at `manifest_offset`,
+sections covering `[64, payload_len - 128)` with no gaps or overlaps, manifest counts
+matching the header, every block reference staying inside its block, per-file raw accounting
+equal to `size`, file sizes summing to the block's raw length, and the manifest consumed
+byte-exactly.
+
+Writing this example changed the format twice: the manifest had no `blocks` field to carry
+the `Block` records that `block_count` announces (added), and `payload_fingerprint` was
+defined as a hash of the digest inside the region that digest covers (circular; the field is
+removed and C5 now defines the fingerprint as the verified digest itself).
 
 ## Acceptance criteria for the v1 implementation PRs
 

@@ -33,8 +33,10 @@ policy, CI level, decode-side cost) — those wait for the extensions listed at 
 
 ## Reference payload (corpus 1)
 
-- Installed Electron-style desktop application (`@codebufffreebuff-desktop` under
-  `%LOCALAPPDATA%\Programs`) as a stand-in for a Tauri app payload.
+- Installed Electron-style desktop application of a developer machine
+  (`%LOCALAPPDATA%\Programs`), used as a stand-in for a Tauri app payload. This report
+  records class-level aggregates and the listing fingerprint only: no file names, no
+  application identity.
 - Selection: regular files >= 64 KiB — 131 files, 540 106 180 B (515.1 MiB) raw.
 - Composition by class (PE detected by the `MZ`/`PE\0\0` header and the `Machine` field):
 
@@ -168,8 +170,12 @@ Result: **2.12% smaller on the PE bytes with no slowdown** (the BCJ pass is a
 length-preserving preprocessing step; F measured faster within run noise). Cross-check: the
 same delta applied to the full corpus predicts 1.57% overall, and the whole-corpus
 measurement showed 1.63%, which is consistent. The adoption criterion for a default BCJ on
-PE input is therefore met on this corpus; the decision itself is the owner's, and the
-planned PE/ARM64 corpus in the extensions repeats it for ARM64 binaries.
+PE input is therefore met on this corpus, and the packer policy adopts bcj-x86 for PE x64
+conditionally; ARM64 stays off until corpus 2 provides data. Note which measurement is which:
+variant F in the results table applies BCJ to **every byte of the concatenated stream**,
+including the 28% that are not PE, so its 1.63% is a diluted lower bound; the PE-only run in
+this section is the one that matches the policy (the filter is selected per PE file by its
+`Machine` field), and the policy effect on the whole payload is therefore ~1.5%
 
 ## Reading of the results
 
@@ -193,6 +199,38 @@ planned PE/ARM64 corpus in the extensions repeats it for ARM64 binaries.
 - Headroom in G: units larger than 8 MiB, or per-file units for the largest binaries, gain
   another 3.4% over F. The default block size is therefore not settled by this run.
 
+## End-to-end estimate (v1 container vs the shipped v0 file)
+
+The comparisons above are payload against payload. For an end-to-end number, the v1
+container overhead was estimated from the record layout in `docs/format.md` (postcard
+varint widths per field, one block record per 8 MiB block, one reference per file extent),
+not from a rule of thumb: the script and its inputs live in the measurement artifact
+directory. For this corpus (131 files, 65 blocks, 180 file-to-block references):
+
+| component | bytes |
+|---|---|
+| string table (134 strings, 4 846 B blob) | 4 846 |
+| manifest: 65 block records | 4 809 |
+| manifest: 131 file records (incl. 180 refs) | 3 648 |
+| manifest: header fields, app strings, hashes | 132 |
+| payload header | 64 |
+| signature block | 128 |
+| **container overhead total** | **13 627** |
+
+The estimate excludes config, assets, and uninstaller sections (this corpus has none) and the
+Authenticode table (the v0 baseline file is unsigned as well).
+
+| end-to-end variant | bytes | vs v0 file 204 860 811 B |
+|---|---|---|
+| v1 with dictionary-sized blocks (E payload) | 178 761 464 | **-12.74%** |
+| v1 with the adopted BCJ policy (PE-only payload) | 175 958 255 | **-14.11%** |
+| v1 with whole-stream BCJ (F payload, upper bound) | 175 841 738 | -14.17% |
+
+Writing the estimate exposed one gap in the spec: the manifest structure listed `files` and
+`assets` but no place to carry the `Block` records, even though the header carries
+`block_count`. The spec now has `blocks: Vec<Block>` in `PackManifest`; without it the block
+table had nowhere to live. This is exactly what the byte-level example is for.
+
 ## Verdict
 
 The two-level model (block = compression unit, CDC chunk = raw-hashing unit) is the v1.0
@@ -200,6 +238,20 @@ data model: the measured gain is 14.0-15.4% over the 64 KiB configuration and at
 against every independent configuration measured, and the chunk-level hashing unit is
 required by the phase-3 delta artifact regardless. Default parameters are not ratified by
 this run; the extensions below settle them.
+
+## Packer policy (current defaults)
+
+Not normative: the reader accepts any payload that satisfies the format rules, and these
+values can change without re-ratifying the specification (decision D11 in `docs/format.md`).
+
+| policy | current default | source |
+|---|---|---|
+| block size | 8 MiB raw | first run; the block-size sweep (extension b) may raise it |
+| dictionary | block size, capped by LZMA2_MAX_DICT (32 MiB) | D vs E measured equal on 8 MiB blocks |
+| pre-filter | bcj-x86 for PE x64 (2.12% on the PE subset, no slowdown); ARM64 off | this report; ARM64 re-checked on corpus 2 |
+| codec | LZMA2 preset 6, Brotli q9 if smaller, store if smaller | production parity |
+| grouping / order | deterministic ascending path order | B7 in the spec keeps offsets normative, order stays policy |
+| compression profile | release: LZMA2 preset 6; CI: lower preset or store | extension i, unmeasured |
 
 ## Planned extensions (owner review 2026-10-05, section 4.3)
 
